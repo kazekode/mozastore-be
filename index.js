@@ -15,6 +15,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Alias middleware for Koyeb: if Koyeb strips '/api', this restores it.
+app.use((req, res, next) => {
+    if (!req.url.startsWith('/api') && !req.url.startsWith('/health') && req.url !== '/') {
+        req.url = '/api' + req.url;
+    }
+    next();
+});
+
 const googleClient = new OAuth2Client(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
@@ -935,11 +943,22 @@ app.post('/api/settings/payment-gateway', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.get('/api/settings/theme', (req, res) => res.json({}));
+app.post('/api/settings/theme', (req, res) => res.json({ success: true }));
+
+// Default health check endpoint and root route
+app.get('/health', (req, res) => res.json({ status: 'ok', message: 'API is running' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'API is running. Access endpoints via /api/...' }));
+
+// Catch-all route to help debug 404s
+app.use((req, res, next) => {
+    console.log(`[404] Cannot GET/POST: ${req.method} ${req.originalUrl}`);
+    res.status(404).json({ error: `Route ${req.method} ${req.originalUrl} not found` });
+});
+
+const PORT = process.env.PORT || 8000;
+app.listen(PORT, '0.0.0.0', () => {
     console.log("Backend running on port " + PORT);
 });
 
-app.get('/api/settings/theme', (req, res) => res.json({}));
-app.post('/api/settings/theme', (req, res) => res.json({ success: true }));
 
