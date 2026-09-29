@@ -180,6 +180,38 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
                     console.error('KazePay create-payment error:', apiErr.response?.data || apiErr.message);
                 }
             }
+        } else if (gateway === 'kitaqris') {
+            const merchantId = setting?.settings?.merchant_id || process.env.KITAQRIS_MERCHANT_ID || "178753767150";
+            const apiKey = setting?.settings?.api_key || process.env.KITAQRIS_API_KEY || "DsuTmOfKxaQ7Uwt5RVar7Y9gJ5iWhPVxvYtQ8ZM0";
+            if (merchantId && apiKey) {
+                try {
+                    const response = await axios.post(
+                        'https://klikqris.com/api/qris/create',
+                        {
+                            order_id: order._id.toString(),
+                            amount: order.totalPrice,
+                            id_merchant: merchantId
+                        },
+                        {
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'x-api-key': apiKey,
+                                'id_merchant': merchantId
+                            }
+                        }
+                    );
+                    const responseData = response.data.data;
+                    if (response.data.status && responseData) {
+                        paymentUrl = responseData.qris_url || responseData.qris_image;
+                        paymentReference = responseData.order_id;
+                        if (responseData.total_amount) {
+                            order.totalPrice = Number(responseData.total_amount);
+                        }
+                    }
+                } catch (apiErr) {
+                    console.error('KitaQris create-payment error:', apiErr.response?.data || apiErr.message);
+                }
+            }
         }
 
         order.paymentUrl = paymentUrl || "MOCK_QRIS_URL_FOR_NOW";
@@ -236,6 +268,29 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                     isExpired = st === 'expired' || st === 'failed' || st === 'cancel';
                 } catch (apiErr) {
                     console.error('KazePay check-payment error:', apiErr.response?.data || apiErr.message);
+                }
+            } else {
+                isPaid = true; // MOCK if no credentials
+            }
+        } else if (gateway === 'kitaqris') {
+            const merchantId = setting?.settings?.merchant_id || process.env.KITAQRIS_MERCHANT_ID || "178753767150";
+            const apiKey = setting?.settings?.api_key || process.env.KITAQRIS_API_KEY || "DsuTmOfKxaQ7Uwt5RVar7Y9gJ5iWhPVxvYtQ8ZM0";
+            if (merchantId && apiKey && order.paymentReference) {
+                try {
+                    const response = await axios.get(`https://klikqris.com/api/qris/status/${order.paymentReference}`, {
+                        headers: {
+                            'x-api-key': apiKey,
+                            'id_merchant': merchantId
+                        }
+                    });
+                    const responseData = response.data.data;
+                    if (response.data.status && responseData) {
+                        const st = responseData.status?.toLowerCase();
+                        isPaid = st === 'success' || st === 'paid' || st === 'settlement';
+                        isExpired = st === 'expired' || st === 'failed' || st === 'cancel';
+                    }
+                } catch (apiErr) {
+                    console.error('KitaQris check-payment error:', apiErr.response?.data || apiErr.message);
                 }
             } else {
                 isPaid = true; // MOCK if no credentials
