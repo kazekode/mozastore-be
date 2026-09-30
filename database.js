@@ -129,8 +129,8 @@ categorySchema.index({ botId: 1, name: 1 }, { unique: true });
 
 const transactionSchema = new mongoose.Schema(
     {
-        userId: { type: Number, required: true, index: true },
-        botId: { type: Number, required: true, index: true },
+        userId: { type: mongoose.Schema.Types.Mixed, required: false, index: true },
+        botId: { type: Number, required: false, index: true },
         productId: { type: String, required: true },
         productName: { type: String, required: true },
         quantity: { type: Number, required: true, default: 1 },
@@ -140,6 +140,20 @@ const transactionSchema = new mongoose.Schema(
         paymentMethod: { type: String, default: "balance" },
         snk: { type: String, default: "" },
         reffId: { type: String, required: true, unique: true },
+        
+        // --- INTEGRASI WEBSITE ---
+        source: { type: String, default: "telegram", index: true },
+        orderId: { type: String, index: true, default: null }, 
+        isGuest: { type: Boolean, default: false },
+        guestEmail: { type: String, default: null },
+        guestId: { type: String, default: null },
+        guestTokenHash: { type: String, default: null },
+        guestTokenExpires: { type: Date, default: null },
+        paymentUrl: { type: String, default: null },
+        paymentReference: { type: String, default: null },
+        emailSent: { type: Boolean, default: false },
+        emailSentAt: { type: Date, default: null },
+        stockIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'ProductStock' }]
     },
     { timestamps: true }
 );
@@ -224,31 +238,6 @@ export const AuthUser =
 export const ProductStock =
     mongoose.models.ProductStock ||
     mongoose.model("ProductStock", productStockSchema);
-const orderSchema = new mongoose.Schema({
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'WebUser' },
-    totalPrice: { type: Number, required: true },
-    status: { type: String, default: 'pending' },
-    isGuest: { type: Boolean, default: false },
-    guestEmail: { type: String, default: null },
-    guestId: { type: String, default: null },
-    guestTokenHash: { type: String, default: null },
-    guestTokenExpires: { type: Date, default: null },
-    paymentUrl: { type: String, default: null },
-    paymentReference: { type: String, default: null },
-    emailSent: { type: Boolean, default: false },
-    emailSentAt: { type: Date, default: null },
-}, { timestamps: true });
-
-const orderItemSchema = new mongoose.Schema({
-    orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order' },
-    productId: { type: String, required: true },
-    quantity: { type: Number, required: true },
-    priceAtTime: { type: Number, required: true },
-    stockId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductStock', default: null }
-}, { timestamps: true });
-
-export const Order = mongoose.models.Order || mongoose.model("Order", orderSchema);
-export const OrderItem = mongoose.models.OrderItem || mongoose.model("OrderItem", orderItemSchema);
 
 export async function startInit() {
     await User.init();

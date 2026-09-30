@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { connectDB, Product, Category, User, Transaction, AuthUser, WebUser, getProductList, Order, OrderItem, PaymentGatewaySetting, takeProductAccount, ProductStock, SmtpSetting } from "./database.js";
+import { connectDB, Product, Category, User, Transaction, AuthUser, WebUser, getProductList, PaymentGatewaySetting, takeProductAccount, ProductStock, SmtpSetting } from "./database.js";
 import { getTransporter, testSmtpConnection, sendOrderEmail } from "./mailer.js";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
@@ -36,11 +36,50 @@ const generateQRIS = (qrisString, amount) => {
     return `${qrisString}`; 
 };
 
+const mapTransactionsToOrder = (transactions) => {
+    if (!transactions || transactions.length === 0) return null;
+    const first = transactions[0];
+    const items = transactions.map(t => ({
+        id: t._id,
+        productId: t.productId,
+        quantity: t.quantity,
+        priceAtTime: t.price,
+        stockId: t.stockIds && t.stockIds.length > 0 ? t.stockIds[0] : null,
+        products: { name: t.productName } // basic mapping, can be enriched
+    }));
+    const totalPrice = transactions.reduce((sum, t) => sum + t.totalAmount, 0);
+    
+    return {
+        _id: first.orderId,
+        id: first.orderId,
+        userId: first.userId,
+        user_id: first.userId,
+        guestEmail: first.guestEmail,
+        guest_email: first.guestEmail,
+        isGuest: first.isGuest,
+        totalPrice: totalPrice,
+        total_price: totalPrice,
+        paymentUrl: first.paymentUrl,
+        payment_url: first.paymentUrl,
+        paymentReference: first.paymentReference,
+        payment_reference: first.paymentReference,
+        createdAt: first.createdAt,
+        created_at: first.createdAt,
+        status: first.status,
+        guestTokenHash: first.guestTokenHash,
+        guestTokenExpires: first.guestTokenExpires,
+        emailSent: first.emailSent,
+        items: items
+    };
+};
+
 // ======== ORDER PROCESS ROUTES ========
 app.get("/api/orders/:id", async (req, res) => {
     try {
-        const order = await Order.findById(req.params.id);
-        if (!order) return res.status(404).json({ error: "Order not found" });
+        const transactions = await Transaction.find({ orderId: req.params.id });
+        if (!transactions || transactions.length === 0) return res.status(404).json({ error: "Order not found" });
+
+        const order = mapTransactionsToOrder(transactions);
 
         // Access Control Logic
         let hasAccess = false;
@@ -49,7 +88,7 @@ app.get("/api/orders/:id", async (req, res) => {
             try {
                 const token = authHeader.split(" ")[1];
                 const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
-                if (decoded.is_admin || (order.userId && order.userId.toString() === decoded.id)) {
+                if (decoded.is_admin || (order.user_id && order.user_id.toString() === decoded.id)) {
                     hasAccess = true;
                 }
             } catch (err) {
@@ -75,38 +114,27 @@ app.get("/api/orders/:id", async (req, res) => {
             return res.status(403).json({ error: "Akses Ditolak", expired: order.isGuest });
         }
 
-        const items = await OrderItem.find({ orderId: order._id });
-        
-        // Populate products and stocks
-        const enrichedItems = await Promise.all(items.map(async item => {
+        // Enrich items with product & stock details
+        const enrichedItems = await Promise.all(transactions.map(async item => {
             const product = await Product.findOne({ productId: item.productId }) || await Product.findById(item.productId).catch(() => null);
             let stockContent = null;
-            if (item.stockId) {
-                const stock = await ProductStock.findById(item.stockId);
+            if (item.stockIds && item.stockIds.length > 0) {
+                const stock = await ProductStock.findById(item.stockIds[0]);
                 if (stock) stockContent = stock.accountData;
             }
             return {
-                ...item.toObject(),
                 id: item._id,
-                price: item.priceAtTime,
+                quantity: item.quantity,
+                price: item.price,
                 product_id: item.productId,
-                stock_id: item.stockId,
-                products: product ? { name: product.name, login_instructions: product.loginInstructions || product.desc } : null,
+                stock_id: item.stockIds && item.stockIds.length > 0 ? item.stockIds[0] : null,
+                products: product ? { name: product.name, login_instructions: product.loginInstructions || product.desc } : { name: item.productName },
                 product_stocks: stockContent ? { content: stockContent } : null
             };
         }));
 
-        const o = order.toObject();
         res.json({ 
-            ...o, 
-            id: o._id, 
-            user_id: o.userId,
-            guest_email: o.guestEmail,
-            isGuest: o.isGuest,
-            total_price: o.totalPrice, 
-            payment_url: o.paymentUrl, 
-            payment_reference: o.paymentReference, 
-            created_at: o.createdAt,
+            ...order,
             items: enrichedItems 
         });
     } catch (err) {
@@ -116,8 +144,9 @@ app.get("/api/orders/:id", async (req, res) => {
 
 app.post("/api/orders/:id/create-payment", async (req, res) => {
     try {
-        const order = await Order.findById(req.params.id);
-        if (!order) return res.status(404).json({ error: "Order not found" });
+        const transactions = await Transaction.find({ orderId: req.params.id });
+        if (!transactions || transactions.length === 0) return res.status(404).json({ error: "Order not found" });
+        const order = mapTransactionsToOrder(transactions);
         if (order.status !== 'pending') return res.status(400).json({ error: "Order is not pending" });
         if (order.paymentUrl && order.paymentUrl !== "MOCK_QRIS_URL_FOR_NOW") {
             return res.json({ success: true, paymentUrl: order.paymentUrl, paymentReference: order.paymentReference, totalPrice: order.totalPrice });
@@ -127,21 +156,22 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
         const gateway = setting ? setting.gateway_name : 'tokopay';
 
         let paymentUrl = null;
-        let paymentReference = order._id.toString();
+        let paymentReference = order.id.toString();
+        let newTotalPrice = order.totalPrice;
 
         if (gateway === 'tokopay') {
             const mId = setting?.settings?.merchant_id || process.env.TOKOPAY_MERCHANT;
             const sKey = setting?.settings?.secret_key || process.env.TOKOPAY_SECRET;
             if (mId && sKey) {
-                const url = `https://api.tokopay.id/v1/order?merchant=${mId}&secret=${sKey}&ref_id=${order._id}&nominal=${order.totalPrice}`;
+                const url = `https://api.tokopay.id/v1/order?merchant=${mId}&secret=${sKey}&ref_id=${order.id}&nominal=${order.totalPrice}`;
                 const { data } = await axios.get(url);
                 if (data.status === 'Success' && data.data?.qr_link) {
                     paymentUrl = data.data.qr_link;
                     paymentReference = data.data.trx_id;
                     if (data.data.total_pay) {
-                        order.totalPrice = Number(data.data.total_pay);
+                        newTotalPrice = Number(data.data.total_pay);
                     } else if (data.data.amount) {
-                        order.totalPrice = Number(data.data.amount);
+                        newTotalPrice = Number(data.data.amount);
                     }
                 }
             }
@@ -170,11 +200,11 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
                     paymentUrl = responseData.qr_string || responseData.qr_url || responseData.qr_image || responseData.qr_link || responseData.qris_url || responseData.qris || responseData.qris_string;
                     paymentReference = responseData.ref_id || responseData.reference_id || responseData.trx_id;
                     if (responseData.amount) {
-                        order.totalPrice = Number(responseData.amount);
+                        newTotalPrice = Number(responseData.amount);
                     } else if (responseData.total_amount) {
-                        order.totalPrice = Number(responseData.total_amount);
+                        newTotalPrice = Number(responseData.total_amount);
                     } else if (responseData.total_pay) {
-                        order.totalPrice = Number(responseData.total_pay);
+                        newTotalPrice = Number(responseData.total_pay);
                     }
                 } catch (apiErr) {
                     console.error('KazePay create-payment error:', apiErr.response?.data || apiErr.message);
@@ -188,7 +218,7 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
                     const response = await axios.post(
                         'https://klikqris.com/api/qris/create',
                         {
-                            order_id: order._id.toString(),
+                            order_id: order.id.toString(),
                             amount: order.totalPrice,
                             id_merchant: merchantId
                         },
@@ -205,7 +235,7 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
                         paymentUrl = responseData.qris_url || responseData.qris_image;
                         paymentReference = responseData.order_id;
                         if (responseData.total_amount) {
-                            order.totalPrice = Number(responseData.total_amount);
+                            newTotalPrice = Number(responseData.total_amount);
                         }
                     }
                 } catch (apiErr) {
@@ -214,11 +244,21 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
             }
         }
 
-        order.paymentUrl = paymentUrl || "MOCK_QRIS_URL_FOR_NOW";
-        order.paymentReference = paymentReference;
-        await order.save();
+        paymentUrl = paymentUrl || "MOCK_QRIS_URL_FOR_NOW";
+        
+        await Transaction.updateMany(
+            { orderId: req.params.id },
+            { 
+                $set: { 
+                    paymentUrl, 
+                    paymentReference 
+                } 
+            }
+        );
+        // Note: we don't update individual transaction totalAmount if the total gateway amount slightly differs to avoid complexity. 
+        // We just return the newTotalPrice for UI.
 
-        res.json({ success: true, paymentUrl: order.paymentUrl, paymentReference: order.paymentReference, totalPrice: order.totalPrice });
+        res.json({ success: true, paymentUrl, paymentReference, totalPrice: newTotalPrice });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -226,8 +266,10 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
 
 app.post("/api/orders/:id/check-payment", async (req, res) => {
     try {
-        const order = await Order.findById(req.params.id);
-        if (!order) return res.status(404).json({ error: "Order not found" });
+        const transactions = await Transaction.find({ orderId: req.params.id });
+        if (!transactions || transactions.length === 0) return res.status(404).json({ error: "Order not found" });
+        const order = mapTransactionsToOrder(transactions);
+
         if (order.status === 'completed' || order.status === 'paid') return res.json({ status: order.status });
 
         const setting = await PaymentGatewaySetting.findOne({ is_active: true });
@@ -240,7 +282,7 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
             const mId = setting?.settings?.merchant_id || process.env.TOKOPAY_MERCHANT;
             const sKey = setting?.settings?.secret_key || process.env.TOKOPAY_SECRET;
             if (mId && sKey) {
-                const url = `https://api.tokopay.id/v1/transaction?merchant=${mId}&secret=${sKey}&ref_id=${order.paymentReference || order._id}`;
+                const url = `https://api.tokopay.id/v1/transaction?merchant=${mId}&secret=${sKey}&ref_id=${order.paymentReference || order.id}`;
                 const { data } = await axios.get(url);
                 if (data.status === 'Success' && data.data) {
                     const st = data.data.status?.toLowerCase();
@@ -300,31 +342,30 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
         }
 
         if (isExpired) {
-            order.status = 'expired';
-            await order.save();
+            await Transaction.updateMany({ orderId: req.params.id }, { $set: { status: 'expired' } });
             return res.json({ status: 'expired' });
         }
 
         if (isPaid) {
-            order.status = 'paid';
-            await order.save();
-            
             // ALLOCATE STOCK SECURELY
-            const items = await OrderItem.find({ orderId: order._id });
             const botId = parseInt(process.env.DEFAULT_BOT_ID) || 1;
             
-            for (const item of items) {
-                const stocksToTake = await ProductStock.find({ productId: item.productId, isSold: false }).limit(item.quantity);
-                if (stocksToTake.length >= item.quantity) {
-                    const stockIds = stocksToTake.map(s => s._id);
-                    await ProductStock.updateMany({ _id: { $in: stockIds } }, { $set: { isSold: true, trxRefId: order._id.toString() } });
-                    item.stockId = stockIds[0]; 
-                    await item.save();
+            for (const item of transactions) {
+                // If this item was not already allocated
+                if (!item.stockIds || item.stockIds.length === 0) {
+                    const result = await takeProductAccount(botId, item.productId, item.quantity, req.params.id);
+                    if (result.success) {
+                        // find the allocated stock ids for this trxRefId to store in Transaction
+                        const allocatedStocks = await ProductStock.find({ trxRefId: req.params.id, productId: item.productId });
+                        const stockIds = allocatedStocks.map(s => s._id);
+                        await Transaction.findByIdAndUpdate(item._id, {
+                            $set: { stockIds: stockIds }
+                        });
+                    }
                 }
             }
 
-            order.status = 'completed';
-            await order.save();
+            await Transaction.updateMany({ orderId: req.params.id }, { $set: { status: 'completed' } });
             
             // Send Email Notification Idempotently
             if (!order.emailSent) {
@@ -340,38 +381,36 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                 
                 if (toEmail) {
                     let orderItemsForEmail = [];
-                    for (const item of items) {
+                    for (const item of transactions) {
                         const prod = await Product.findOne({ productId: item.productId });
-                        const soldStocks = await ProductStock.find({ trxRefId: order._id.toString(), productId: item.productId });
+                        const soldStocks = await ProductStock.find({ trxRefId: req.params.id, productId: item.productId });
                         
                         let accountData = soldStocks.map(st => st.accountData).filter(Boolean).join('\n\n---\n\n');
                         
                         orderItemsForEmail.push({
-                            name: prod ? prod.name : item.productId,
+                            name: prod ? prod.name : item.productName,
                             quantity: item.quantity,
-                            price: item.priceAtTime,
+                            price: item.price,
                             accountData: accountData || null
                         });
                         
-                        console.log(`[Order Email Debug] OrderID: ${order._id} | Item: ${prod ? prod.name : item.productId} | Account Details Found: ${soldStocks.length} | AccountData Available: ${!!accountData}`);
+                        console.log(`[Order Email Debug] OrderID: ${req.params.id} | Item: ${prod ? prod.name : item.productId} | Account Details Found: ${soldStocks.length} | AccountData Available: ${!!accountData}`);
                     }
                     
                     const orderData = {
-                        orderId: order._id.toString(),
+                        orderId: req.params.id,
                         date: new Date(order.createdAt).toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
                         totalAmount: order.totalPrice,
                         items: orderItemsForEmail,
                         recipientName
                     };
                     
-                    console.log(`[Order Email Debug] Sending email to ${toEmail} for OrderID: ${order._id} with ${orderItemsForEmail.length} items.`);
+                    console.log(`[Order Email Debug] Sending email to ${toEmail} for OrderID: ${req.params.id} with ${orderItemsForEmail.length} items.`);
                     
                     const emailResult = await sendOrderEmail(toEmail, orderData);
                     if (emailResult && emailResult.success) {
-                        console.log(`[Order Email Debug] Email sent successfully for OrderID: ${order._id}`);
-                        order.emailSent = true;
-                        order.emailSentAt = new Date();
-                        await order.save();
+                        console.log(`[Order Email Debug] Email sent successfully for OrderID: ${req.params.id}`);
+                        await Transaction.updateMany({ orderId: req.params.id }, { $set: { emailSent: true, emailSentAt: new Date() } });
                     } else {
                         console.error("Gagal mengirim email notifikasi:", emailResult ? emailResult.error : 'Unknown');
                     }
@@ -389,7 +428,7 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
 
 app.post("/api/orders/:id/cancel", async (req, res) => {
     try {
-        await Order.findByIdAndUpdate(req.params.id, { status: 'cancelled' });
+        await Transaction.updateMany({ orderId: req.params.id }, { $set: { status: 'cancelled' } });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -499,15 +538,14 @@ app.post("/api/auth/merge-guest", async (req, res) => {
     try {
         const { userId, guestId, userEmail } = req.body;
         
-        // Match both guestId (session proof) and guestEmail (email proof)
         if (guestId && userEmail) {
-            await Order.updateMany(
-                { isGuest: true, guestId: guestId, guestEmail: userEmail }, 
+            await Transaction.updateMany(
+                { isGuest: true, guestId: guestId, guestEmail: userEmail, source: "website" }, 
                 { $set: { userId: userId, isGuest: false } }
             );
         } else if (guestId) {
-            await Order.updateMany(
-                { isGuest: true, guestId: guestId }, 
+            await Transaction.updateMany(
+                { isGuest: true, guestId: guestId, source: "website" }, 
                 { $set: { userId: userId, isGuest: false } }
             );
         }
@@ -627,13 +665,11 @@ app.post("/api/orders", async (req, res) => {
         let calculatedTotal = 0;
         const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
         
-        // Re-validate prices securely from DB
         const validatedItems = [];
         for (const item of items) {
             const product = await Product.findOne({ botId, productId: item.productId });
             if (!product) return res.status(400).json({ error: `Produk ${item.productId} tidak ditemukan` });
             
-            // Check stock availability securely
             const availableStock = await ProductStock.countDocuments({ botId, productId: item.productId, isSold: false });
             if (availableStock < item.quantity) {
                 return res.status(400).json({ error: `Stok untuk ${product.name} tidak mencukupi (Sisa: ${availableStock})` });
@@ -644,18 +680,20 @@ app.post("/api/orders", async (req, res) => {
             
             validatedItems.push({
                 productId: item.productId,
+                productName: product.name,
                 quantity: item.quantity,
-                priceAtTime: product.price
+                price: product.price,
+                totalAmount: itemTotal
             });
         }
         
-        // Allow unique code margin from frontend (up to 999 IDR max difference) for manual gateways
         const frontendTotal = req.body.total_price || calculatedTotal;
         const diff = frontendTotal - calculatedTotal;
         if (diff > 0 && diff <= 999) {
             calculatedTotal = frontendTotal; 
+            // adjust totalAmount of the first item to match frontend exact total
+            validatedItems[0].totalAmount += diff;
         } else if (diff !== 0) {
-            // Price mismatch detected
             return res.status(400).json({ error: "Terjadi ketidaksesuaian harga dengan database. Silakan muat ulang halaman." });
         }
         
@@ -668,33 +706,42 @@ app.post("/api/orders", async (req, res) => {
             guestTokenHash = await bcrypt.hash(guestToken, 10);
             guestTokenExpires = new Date(Date.now() + 3 * 60 * 60 * 1000); // 3 hours
         }
-        
-        const order = await Order.create({
-            userId: isGuest ? null : userId,
-            isGuest,
-            guestEmail,
-            guestId,
-            guestTokenHash,
-            guestTokenExpires,
-            totalPrice: calculatedTotal,
-            status: 'pending'
-        });
 
-        const orderItemsToInsert = [];
-        validatedItems.forEach(item => {
-            for (let i = 0; i < item.quantity; i++) {
-                orderItemsToInsert.push({
-                    orderId: order._id,
+        const newOrderId = `ORD-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+        
+        const transactionsToInsert = [];
+        for (let i = 0; i < validatedItems.length; i++) {
+            const item = validatedItems[i];
+            for (let j = 0; j < item.quantity; j++) {
+                transactionsToInsert.push({
+                    userId: isGuest ? null : userId,
+                    botId,
                     productId: item.productId,
-                    quantity: 1, // Store as individual items for stock tracking
-                    priceAtTime: item.priceAtTime
+                    productName: item.productName,
+                    quantity: 1,
+                    price: item.price,
+                    totalAmount: item.price,
+                    status: 'pending',
+                    reffId: `${newOrderId}-${i}-${j}`,
+                    source: 'website',
+                    orderId: newOrderId,
+                    isGuest,
+                    guestEmail,
+                    guestId,
+                    guestTokenHash,
+                    guestTokenExpires,
+                    paymentMethod: 'qris'
                 });
             }
-        });
+        }
+        // Apply frontend total diff to the very first item if any
+        if (diff > 0 && diff <= 999 && transactionsToInsert.length > 0) {
+            transactionsToInsert[0].totalAmount += diff;
+        }
 
-        await OrderItem.insertMany(orderItemsToInsert);
+        await Transaction.insertMany(transactionsToInsert);
 
-        res.json({ success: true, orderId: order._id, guestToken });
+        res.json({ success: true, orderId: newOrderId, guestToken });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -705,15 +752,24 @@ app.post("/api/orders", async (req, res) => {
 app.get('/api/orders', async (req, res) => {
     try {
         const { userId, isGuest, guestId } = req.query;
-        let query = {};
+        let query = { source: 'website' };
         if (userId && userId !== 'undefined') query.userId = userId;
         else if (isGuest === 'true' && guestId) query.guestId = guestId;
         
-        const orders = await Order.find(query).sort({ createdAt: -1 });
-        const mapped = orders.map(o => {
-            const obj = o.toObject();
-            return { ...obj, id: obj._id, total_price: obj.totalPrice, created_at: obj.createdAt };
-        });
+        // Find distinct orders
+        const transactions = await Transaction.find(query).sort({ createdAt: -1 });
+        
+        // Group by orderId
+        const orderMap = {};
+        for (const t of transactions) {
+            if (!orderMap[t.orderId]) orderMap[t.orderId] = [];
+            orderMap[t.orderId].push(t);
+        }
+        
+        const mapped = Object.values(orderMap).map(grouped => mapTransactionsToOrder(grouped)).filter(Boolean);
+        // Sort by created_at desc
+        mapped.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        
         res.json(mapped);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -831,23 +887,93 @@ app.post('/api/admin/smtp/send-test', async (req, res) => {
 });
 
 // ======== ADMIN ROUTES ========
+app.get('/api/admin/transactions', async (req, res) => {
+    try {
+        const transactions = await Transaction.find().sort({ createdAt: -1 }).limit(500); // Batasi 500 untuk performa admin list
+        res.json(transactions);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/admin/stats', async (req, res) => {
     try {
         const productsCount = await Product.countDocuments();
-        const ordersCount = await Order.countDocuments();
-        const revenueAgg = await Order.aggregate([
-            { $match: { status: { $in: ['paid', 'completed'] } } },
-            { $group: { _id: null, total: { $sum: '$totalPrice' } } }
-        ]);
-        const pendingCount = await Order.countDocuments({ status: 'pending' });
-        const recentOrders = await Order.find().sort({ createdAt: -1 }).limit(5);
+        
+        // --- ALL STATS ---
+        const allTransactions = await Transaction.find();
+        
+        let website = {
+            orders: 0, revenue: 0, pending: 0, completed: 0, items_sold: 0
+        };
+        let telegram = {
+            orders: 0, revenue: 0, pending: 0, completed: 0, items_sold: 0
+        };
+        
+        // Helper to count orders for web based on unique orderId
+        const webOrderIds = new Set();
+        
+        for (const t of allTransactions) {
+            const isWeb = t.source === 'website';
+            const stat = isWeb ? website : telegram;
+            
+            if (isWeb && t.orderId) {
+                if (!webOrderIds.has(t.orderId)) {
+                    webOrderIds.add(t.orderId);
+                    stat.orders++;
+                    if (t.status === 'pending') stat.pending++;
+                    if (t.status === 'completed' || t.status === 'paid') stat.completed++;
+                }
+                // we aggregate revenue/items on every row
+                if (t.status === 'completed' || t.status === 'paid') {
+                    stat.revenue += t.totalAmount;
+                    stat.items_sold += t.quantity;
+                }
+            } else {
+                // Telegram (1 row = 1 transaction)
+                stat.orders++;
+                if (t.status === 'pending') stat.pending++;
+                if (t.status === 'completed' || t.status === 'paid') stat.completed++;
+                if (t.status === 'completed' || t.status === 'paid') {
+                    stat.revenue += t.totalAmount;
+                    stat.items_sold += t.quantity;
+                }
+            }
+        }
+        
+        // Recent web orders (grouped)
+        const recentWebRows = await Transaction.find({ source: 'website' }).sort({ createdAt: -1 }).limit(100);
+        const orderGroups = {};
+        for (const r of recentWebRows) {
+            if (!r.orderId) continue;
+            if (!orderGroups[r.orderId]) {
+                orderGroups[r.orderId] = {
+                    id: r.orderId,
+                    userId: r.userId,
+                    totalPrice: 0,
+                    status: r.status,
+                    createdAt: r.createdAt
+                };
+            }
+            orderGroups[r.orderId].totalPrice += r.totalAmount;
+        }
+        
+        const recentWebOrders = Object.values(orderGroups)
+            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+            .slice(0, 5);
 
         res.json({
             products: productsCount,
-            orders: ordersCount,
-            revenue: revenueAgg[0]?.total || 0,
-            pending: pendingCount,
-            recentOrders
+            website,
+            telegram,
+            total: {
+                orders: website.orders + telegram.orders,
+                revenue: website.revenue + telegram.revenue,
+                pending: website.pending + telegram.pending,
+                completed: website.completed + telegram.completed,
+                items_sold: website.items_sold + telegram.items_sold
+            },
+            recentOrders: recentWebOrders
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
