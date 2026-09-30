@@ -929,19 +929,24 @@ app.get('/api/admin/transactions', async (req, res) => {
 
         const skip = (page - 1) * limit;
 
-        const [transactions, total] = await Promise.all([
-            Transaction.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
-            Transaction.countDocuments(query)
-        ]);
+        // Optimasi: Gunakan limit + 1 trick untuk menghindari countDocuments() yang berat
+        const transactions = await Transaction.find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit + 1)
+            .lean();
+
+        const hasNextPage = transactions.length > limit;
+        if (hasNextPage) {
+            transactions.pop(); // Hapus item ekstra
+        }
 
         res.json({
             data: transactions,
             pagination: {
                 page,
                 limit,
-                total,
-                totalPages: Math.ceil(total / limit),
-                hasNextPage: skip + limit < total,
+                hasNextPage,
                 hasPreviousPage: page > 1
             }
         });
@@ -952,7 +957,14 @@ app.get('/api/admin/transactions', async (req, res) => {
 
 app.get('/api/admin/stats', async (req, res) => {
     try {
-        const { period, startDate, endDate } = req.query;
+        const { period, startDate, endDate, heavy } = req.query;
+        
+        const productsCount = await Product.countDocuments();
+
+        if (heavy !== 'true') {
+            return res.json({ products: productsCount });
+        }
+
         let matchQuery = {};
         
         if (startDate && endDate) {
@@ -978,9 +990,7 @@ app.get('/api/admin/stats', async (req, res) => {
             }
         }
 
-        const [productsCount, telegramAgg, websiteAgg, recentWebOrdersAgg] = await Promise.all([
-            Product.countDocuments(),
-            
+        const [telegramAgg, websiteAgg] = await Promise.all([
             Transaction.aggregate([
                 { $match: { ...matchQuery, source: { $ne: 'website' } } },
                 {
@@ -1015,37 +1025,12 @@ app.get('/api/admin/stats', async (req, res) => {
                         items_sold: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, "$quantity", 0] } }
                     }
                 }
-            ]),
-            
-            // Recent Orders Preview
-            Transaction.aggregate([
-                { $match: { source: 'website' } },
-                { $sort: { createdAt: -1 } },
-                { 
-                    $group: { 
-                        _id: "$orderId", 
-                        createdAt: { $first: "$createdAt" }, 
-                        status: { $first: "$status" }, 
-                        totalPrice: { $sum: "$totalAmount" },
-                        userId: { $first: "$userId" }
-                    } 
-                },
-                { $sort: { createdAt: -1 } },
-                { $limit: 5 }
             ])
         ]);
 
         const telegram = telegramAgg[0] || { orders: 0, pending: 0, completed: 0, revenue: 0, items_sold: 0 };
         const website = websiteAgg[0] || { orders: 0, pending: 0, completed: 0, revenue: 0, items_sold: 0 };
         
-        const recentOrders = recentWebOrdersAgg.map(r => ({
-            id: r._id,
-            userId: r.userId,
-            totalPrice: r.totalPrice,
-            status: r.status,
-            createdAt: r.createdAt
-        }));
-
         res.json({
             products: productsCount,
             website,
@@ -1056,8 +1041,7 @@ app.get('/api/admin/stats', async (req, res) => {
                 pending: website.pending + telegram.pending,
                 completed: website.completed + telegram.completed,
                 items_sold: website.items_sold + telegram.items_sold
-            },
-            recentOrders
+            }
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
