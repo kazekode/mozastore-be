@@ -753,11 +753,19 @@ app.get('/api/orders', async (req, res) => {
     try {
         const { userId, isGuest, guestId } = req.query;
         let query = { source: 'website' };
-        if (userId && userId !== 'undefined') query.userId = userId;
-        else if (isGuest === 'true' && guestId) query.guestId = guestId;
+        
+        // Prevent fetching ALL orders unconditionally
+        if (userId && userId !== 'undefined') {
+            query.userId = userId;
+        } else if (isGuest === 'true' && guestId) {
+            query.guestId = guestId;
+        } else {
+            // Require some user identifier to fetch user orders
+            return res.json([]);
+        }
         
         // Find distinct orders
-        const transactions = await Transaction.find(query).sort({ createdAt: -1 });
+        const transactions = await Transaction.find(query).sort({ createdAt: -1 }).limit(100);
         
         // Group by orderId
         const orderMap = {};
@@ -768,7 +776,7 @@ app.get('/api/orders', async (req, res) => {
         
         const mapped = Object.values(orderMap).map(grouped => mapTransactionsToOrder(grouped)).filter(Boolean);
         // Sort by created_at desc
-        mapped.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        mapped.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
         
         res.json(mapped);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -889,8 +897,54 @@ app.post('/api/admin/smtp/send-test', async (req, res) => {
 // ======== ADMIN ROUTES ========
 app.get('/api/admin/transactions', async (req, res) => {
     try {
-        const transactions = await Transaction.find().sort({ createdAt: -1 }).limit(500); // Batasi 500 untuk performa admin list
-        res.json(transactions);
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const source = req.query.source || 'all';
+        const status = req.query.status || 'all';
+        const search = req.query.search || '';
+        
+        let query = {};
+        if (source !== 'all') {
+            if (source === 'telegram') {
+                query.source = { $ne: 'website' };
+            } else {
+                query.source = source;
+            }
+        }
+        if (status !== 'all') {
+            if (status === 'completed') {
+                query.status = { $in: ['completed', 'paid'] };
+            } else {
+                query.status = status;
+            }
+        }
+        
+        if (search) {
+            query.$or = [
+                { reffId: { $regex: search, $options: 'i' } },
+                { orderId: { $regex: search, $options: 'i' } },
+                { productName: { $regex: search, $options: 'i' } }
+            ];
+        }
+
+        const skip = (page - 1) * limit;
+
+        const [transactions, total] = await Promise.all([
+            Transaction.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+            Transaction.countDocuments(query)
+        ]);
+
+        res.json({
+            data: transactions,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit),
+                hasNextPage: skip + limit < total,
+                hasPreviousPage: page > 1
+            }
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -898,69 +952,99 @@ app.get('/api/admin/transactions', async (req, res) => {
 
 app.get('/api/admin/stats', async (req, res) => {
     try {
-        const productsCount = await Product.countDocuments();
+        const { period, startDate, endDate } = req.query;
+        let matchQuery = {};
         
-        // --- ALL STATS ---
-        const allTransactions = await Transaction.find();
-        
-        let website = {
-            orders: 0, revenue: 0, pending: 0, completed: 0, items_sold: 0
-        };
-        let telegram = {
-            orders: 0, revenue: 0, pending: 0, completed: 0, items_sold: 0
-        };
-        
-        // Helper to count orders for web based on unique orderId
-        const webOrderIds = new Set();
-        
-        for (const t of allTransactions) {
-            const isWeb = t.source === 'website';
-            const stat = isWeb ? website : telegram;
+        if (startDate && endDate) {
+            matchQuery.createdAt = {
+                $gte: new Date(startDate),
+                $lte: new Date(endDate)
+            };
+        } else if (period) {
+            const now = new Date();
+            let start = new Date();
+            if (period === 'today') {
+                start.setHours(0,0,0,0);
+            } else if (period === '7d') {
+                start.setDate(now.getDate() - 7);
+            } else if (period === '30d') {
+                start.setDate(now.getDate() - 30);
+            } else if (period === 'month') {
+                start.setDate(1);
+                start.setHours(0,0,0,0);
+            }
+            if (period !== 'all') {
+                matchQuery.createdAt = { $gte: start, $lte: now };
+            }
+        }
+
+        const [productsCount, telegramAgg, websiteAgg, recentWebOrdersAgg] = await Promise.all([
+            Product.countDocuments(),
             
-            if (isWeb && t.orderId) {
-                if (!webOrderIds.has(t.orderId)) {
-                    webOrderIds.add(t.orderId);
-                    stat.orders++;
-                    if (t.status === 'pending') stat.pending++;
-                    if (t.status === 'completed' || t.status === 'paid') stat.completed++;
+            Transaction.aggregate([
+                { $match: { ...matchQuery, source: { $ne: 'website' } } },
+                {
+                    $group: {
+                        _id: null,
+                        orders: { $sum: 1 },
+                        pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } },
+                        completed: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, 1, 0] } },
+                        revenue: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, "$totalAmount", 0] } },
+                        items_sold: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, "$quantity", 0] } }
+                    }
                 }
-                // we aggregate revenue/items on every row
-                if (t.status === 'completed' || t.status === 'paid') {
-                    stat.revenue += t.totalAmount;
-                    stat.items_sold += t.quantity;
+            ]),
+            
+            Transaction.aggregate([
+                { $match: { ...matchQuery, source: 'website' } },
+                {
+                    $group: {
+                        _id: "$orderId",
+                        status: { $first: "$status" },
+                        totalAmount: { $sum: "$totalAmount" },
+                        quantity: { $sum: "$quantity" }
+                    }
+                },
+                {
+                    $group: {
+                        _id: null,
+                        orders: { $sum: 1 },
+                        pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } },
+                        completed: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, 1, 0] } },
+                        revenue: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, "$totalAmount", 0] } },
+                        items_sold: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, "$quantity", 0] } }
+                    }
                 }
-            } else {
-                // Telegram (1 row = 1 transaction)
-                stat.orders++;
-                if (t.status === 'pending') stat.pending++;
-                if (t.status === 'completed' || t.status === 'paid') stat.completed++;
-                if (t.status === 'completed' || t.status === 'paid') {
-                    stat.revenue += t.totalAmount;
-                    stat.items_sold += t.quantity;
-                }
-            }
-        }
+            ]),
+            
+            // Recent Orders Preview
+            Transaction.aggregate([
+                { $match: { source: 'website' } },
+                { $sort: { createdAt: -1 } },
+                { 
+                    $group: { 
+                        _id: "$orderId", 
+                        createdAt: { $first: "$createdAt" }, 
+                        status: { $first: "$status" }, 
+                        totalPrice: { $sum: "$totalAmount" },
+                        userId: { $first: "$userId" }
+                    } 
+                },
+                { $sort: { createdAt: -1 } },
+                { $limit: 5 }
+            ])
+        ]);
+
+        const telegram = telegramAgg[0] || { orders: 0, pending: 0, completed: 0, revenue: 0, items_sold: 0 };
+        const website = websiteAgg[0] || { orders: 0, pending: 0, completed: 0, revenue: 0, items_sold: 0 };
         
-        // Recent web orders (grouped)
-        const recentWebRows = await Transaction.find({ source: 'website' }).sort({ createdAt: -1 }).limit(100);
-        const orderGroups = {};
-        for (const r of recentWebRows) {
-            if (!r.orderId) continue;
-            if (!orderGroups[r.orderId]) {
-                orderGroups[r.orderId] = {
-                    id: r.orderId,
-                    userId: r.userId,
-                    totalPrice: 0,
-                    status: r.status,
-                    createdAt: r.createdAt
-                };
-            }
-            orderGroups[r.orderId].totalPrice += r.totalAmount;
-        }
-        
-        const recentWebOrders = Object.values(orderGroups)
-            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-            .slice(0, 5);
+        const recentOrders = recentWebOrdersAgg.map(r => ({
+            id: r._id,
+            userId: r.userId,
+            totalPrice: r.totalPrice,
+            status: r.status,
+            createdAt: r.createdAt
+        }));
 
         res.json({
             products: productsCount,
@@ -973,9 +1057,11 @@ app.get('/api/admin/stats', async (req, res) => {
                 completed: website.completed + telegram.completed,
                 items_sold: website.items_sold + telegram.items_sold
             },
-            recentOrders: recentWebOrders
+            recentOrders
         });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/admin/categories/reorder', async (req, res) => {
@@ -1087,7 +1173,7 @@ app.get('/api/admin/stocks', async (req, res) => {
     try {
         const { productId } = req.query;
         const q = productId ? { productId } : {};
-        const stocks = await ProductStock.find(q).sort({ createdAt: -1 });
+        const stocks = await ProductStock.find(q).sort({ createdAt: -1 }).limit(1000);
         res.json(stocks);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });

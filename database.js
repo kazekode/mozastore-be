@@ -159,6 +159,10 @@ const transactionSchema = new mongoose.Schema(
 );
 transactionSchema.index({ userId: 1, createdAt: -1 });
 transactionSchema.index({ botId: 1, createdAt: -1 });
+transactionSchema.index({ createdAt: -1 });
+transactionSchema.index({ source: 1, createdAt: -1 });
+transactionSchema.index({ status: 1, createdAt: -1 });
+transactionSchema.index({ source: 1, status: 1, createdAt: -1 });
 
 const paymentIntentSchema = new mongoose.Schema(
     {
