@@ -357,6 +357,7 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
 
         if (isExpired) {
             await Order.updateOne({ orderId: req.params.id }, { $set: { status: 'expired' } });
+            await releaseReservedStock(req.params.id);
             return res.json({ status: 'expired' });
         }
 
@@ -444,6 +445,7 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
 app.post("/api/orders/:id/cancel", async (req, res) => {
     try {
         await Order.updateOne({ orderId: req.params.id }, { $set: { status: 'cancelled' } });
+        await releaseReservedStock(req.params.id);
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
