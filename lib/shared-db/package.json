@@ -1,0 +1,11 @@
+{
+  "name": "shared-db",
+  "version": "1.0.0",
+  "description": "Shared database layer for V2",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "mongoose": "^8.0.0",
+    "bcryptjs": "^2.4.3"
+  }
+}

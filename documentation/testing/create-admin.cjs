@@ -4,12 +4,12 @@ const bcrypt = require("bcryptjs");
 
 const MONGODB_URI =
   process.env.MONGODB_URI ||
-  "mongodb+srv://Moza:Store@moza.gfzmtfc.mongodb.net/?appName=Moza";
+  "mongodb+srv://moza:store@apprem.kbpp8u2.mongodb.net/?appName=apprem";
 
 async function createAdmin() {
   try {
     await mongoose.connect(MONGODB_URI, {
-      dbName: process.env.MONGO_DBNAME || "MannDB",
+      dbName: process.env.MONGO_DBNAME || "MannDB_V2",
     });
     console.log("Connected to MongoDB");
 

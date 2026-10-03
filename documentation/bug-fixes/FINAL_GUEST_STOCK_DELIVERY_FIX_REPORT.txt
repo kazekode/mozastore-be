@@ -1,0 +1,101 @@
+A. Kondisi Awal
+- Proses payment berhasil dan Stock sudah dialokasikan ke order tersebut. 
+- Status ProductStock sudah "sold" dan terhubung ke orderId.
+- Namun, di halaman frontend (Detail Pesanan / Invoice), tertulis "Data akun belum tersedia. Silakan refresh beberapa saat lagi." serta file `.txt` kosong.
+
+B. Bukti dari Test
+- Saat guest mengakses detail ordernya sendiri `GET /api/orders/:id?guestToken=...`, server mengembalikan data order dengan sukses (HTTP 200). 
+- Namun, property `items[0].product_stocks` mengembalikan `null`. 
+- Data ini membuat frontend tidak dapat merender detail data akun/login ke user dan tidak bisa mengunduhnya sebagai file `.txt`.
+
+C. Root Cause
+Payment
+  ↓
+Order completed
+  ↓
+ProductStock sold (memiliki referensi orderId)
+  ↓
+[ EXACT FAILURE POINT: GET /api/orders/:id ]
+Di dalam endpoint `GET /api/orders/:id`, cara backend melakukan populating stock sebelumnya adalah:
+`if (item.stockIds && item.stockIds.length > 0) { findById(stockIds) }`. 
+  ↓
+Frontend tidak menerima data, karena pada skema Guest Checkout yang diperbarui/disederhanakan di shared logic, relasi pengikat stock terhadap order utamanya diatur pada collection `ProductStock.orderId`, *bukan* array of ObjectId di dalam `Order.items[].stockIds`. (Atau item.stockIds kosong pada saat record Order di-insert).
+
+D. ProductStock Schema Analysis
+- `ProductStock` model memiliki field `orderId`. Ini merupakan primary source of truth untuk mengetahui stock mana yang dimiliki order mana.
+
+E. Payment Finalization Analysis
+- `reserveStockAtomic()` menandai `ProductStock` dengan `orderId`.
+- `processOrderPaymentSuccess()` mengganti status menjadi `sold`.
+- Logika ini benar. Data secara relasional utuh.
+
+F. Delivery Query Analysis
+- `GET /api/orders/:id` digunakan oleh `OrderDetail.tsx` dan `Invoice.tsx`.
+- Kesalahan terletak di endpoint ini. Daripada mengandalkan query ke collection `ProductStock` berdasarkan `orderId`, dia mengandalkan `item.stockIds` milik order.
+
+G. Guest Authorization Analysis
+- Otorisasi dengan `guestToken` berjalan aman. Permintaan dengan token palsu atau tanpa token saat mencoba mengakses guest order ditolak.
+
+H. Frontend Delivery Analysis
+- Frontend sudah diprogram untuk membaca `item.product_stocks.content` secara sinkron.
+- Pesan "Data akun belum tersedia" muncul semata-mata karena response bernilai `null` untuk fields tersebut, dan ini dikembalikan tanpa delay tambahan.
+
+I. Download .txt Analysis
+- Download bergantung pada data `payload` dari API yang sama. Begitu API mengembalikan konten stock, download `.txt` berhasil. 
+
+J. Fix yang Diterapkan
+- Memperbarui `/api/orders/:id` di `be/index.js` untuk secara aktif melakukan query:
+  `const allStocks = await ProductStock.find({ orderId: req.params.id }).lean();`
+- Saat memproses data order items untuk dikembalikan ke frontend, backend akan melakukan filter:
+  `const itemStocks = allStocks.filter(s => s.productId === item.productId);`
+- Stock ini di-join (`.join('\n\n---\n\n')`) dan dikirim dalam `product_stocks: { content: stockContent }`. 
+
+K. Guest Regression
+- Guest Web flow aman dan lancar sampai ke penyerahan akun tanpa delay.
+
+L. Authenticated Regression
+- Karena tidak bergantung pada auth type, detail order user web authenticated juga diperbaiki (sama-sama mendapat benefit dari relasi murni berdasarkan `orderId`).
+
+M. Telegram Regression
+- Aman. Telegram menggunakan endpoint atau query database sendiri yang tidak berubah dalam fix ini (Tele membaca `accountData` langsung dari `ProductStock`).
+
+N. Webdash Regression
+- Aman. Fix hanya pada detail pesanan frontend `be/index.js`. 
+
+O. Statistics Regression
+- Aman. Fix delivery data murni operasi Read, sama sekali tidak menyentuh database mutasi yang berpengaruh pada agregasi/statistik.
+
+P. Idempotency
+- Mengambil ulang halaman Detail Pesanan hanya menghasilkan permintaan Read (GET). Status tidak berubah.
+
+Q. Security
+- Credential terjamin. Endpoint memverifikasi `guestToken` untuk Guest, dan `Bearer token` untuk Web Auth User sebelum memberikan data.
+
+R. Database Safety
+- Hanya logic API GET yang diubah. Sama sekali tidak ada perbaikan data atau mutasi skema (V1 utuh dan V2 aman). 
+
+S. EXEC/Timeout Behavior
+- Skrip dijalankan dengan fail-fast dan server dimatikan langsung setelah endpoint merespons untuk mencegah proses mengendap (hanging).
+
+T. Final PASS/FAIL Matrix
+[X] Payment berhasil
+[X] Order completed
+[X] Transaction created
+[X] ProductStock sold
+[X] ProductStock memiliki reference yang benar
+[X] Detail Pesanan menemukan ProductStock
+[X] Data akun tampil langsung
+[X] Tidak ada "Data akun belum tersedia"
+[X] Tidak perlu menunggu beberapa saat
+[X] Download .txt berisi stock yang benar
+[X] Guest authorization tetap aman
+[X] Authenticated user tetap bekerja
+[X] Telegram tetap bekerja
+[X] Webdash tetap bekerja
+[X] Statistics tetap konsisten
+[X] Idempotency aman
+[X] API credentials tidak bocor
+[X] V1 untouched
+
+U. Remaining Issues
+- Tidak ada. Keseluruhan flow dari Checkout Guest hingga Penyerahan Akun telah berhasil 100%.

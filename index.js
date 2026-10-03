@@ -1,7 +1,8 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { connectDB, Product, Category, User, Transaction, AuthUser, WebUser, getProductList, PaymentGatewaySetting, takeProductAccount, ProductStock, SmtpSetting } from "./database.js";
+import { connectDB, Product, Category, User, PaymentGatewaySetting, ProductStock, SmtpSetting, Order, Bot, DailySalesSummary, getAdminStats } from "./lib/shared-db/index.js";
+import { reserveStockAtomic, processOrderPaymentSuccess } from "./lib/shared-db/services.js";
 import { getTransporter, testSmtpConnection, sendOrderEmail } from "./mailer.js";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
@@ -36,50 +37,34 @@ const generateQRIS = (qrisString, amount) => {
     return `${qrisString}`; 
 };
 
-const mapTransactionsToOrder = (transactions) => {
-    if (!transactions || transactions.length === 0) return null;
-    const first = transactions[0];
-    const items = transactions.map(t => ({
-        id: t._id,
-        productId: t.productId,
-        quantity: t.quantity,
-        priceAtTime: t.price,
-        stockId: t.stockIds && t.stockIds.length > 0 ? t.stockIds[0] : null,
-        products: { name: t.productName } // basic mapping, can be enriched
-    }));
-    const totalPrice = transactions.reduce((sum, t) => sum + t.totalAmount, 0);
-    
-    return {
-        _id: first.orderId,
-        id: first.orderId,
-        userId: first.userId,
-        user_id: first.userId,
-        guestEmail: first.guestEmail,
-        guest_email: first.guestEmail,
-        isGuest: first.isGuest,
-        totalPrice: totalPrice,
-        total_price: totalPrice,
-        paymentUrl: first.paymentUrl,
-        payment_url: first.paymentUrl,
-        paymentReference: first.paymentReference,
-        payment_reference: first.paymentReference,
-        createdAt: first.createdAt,
-        created_at: first.createdAt,
-        status: first.status,
-        guestTokenHash: first.guestTokenHash,
-        guestTokenExpires: first.guestTokenExpires,
-        emailSent: first.emailSent,
-        items: items
-    };
-};
 
 // ======== ORDER PROCESS ROUTES ========
 app.get("/api/orders/:id", async (req, res) => {
     try {
-        const transactions = await Transaction.find({ orderId: req.params.id });
-        if (!transactions || transactions.length === 0) return res.status(404).json({ error: "Order not found" });
+        const orderDoc = await Order.findOne({ orderId: req.params.id });
+        if (!orderDoc) return res.status(404).json({ error: "Order not found" });
 
-        const order = mapTransactionsToOrder(transactions);
+        const order = {
+            _id: orderDoc.orderId,
+            id: orderDoc.orderId,
+            userId: orderDoc.userId,
+            user_id: orderDoc.userId,
+            guestEmail: orderDoc.guestEmail,
+            guest_email: orderDoc.guestEmail,
+            isGuest: orderDoc.isGuest,
+            totalPrice: orderDoc.totalAmount,
+            total_price: orderDoc.totalAmount,
+            paymentUrl: orderDoc.paymentUrl,
+            payment_url: orderDoc.paymentUrl,
+            paymentReference: orderDoc.paymentReference,
+            payment_reference: orderDoc.paymentReference,
+            createdAt: orderDoc.createdAt,
+            created_at: orderDoc.createdAt,
+            status: orderDoc.status,
+            guestTokenHash: orderDoc.guestTokenHash,
+            guestTokenExpires: orderDoc.guestTokenExpires,
+            emailSent: orderDoc.emailSent
+        };
 
         // Access Control Logic
         let hasAccess = false;
@@ -88,11 +73,20 @@ app.get("/api/orders/:id", async (req, res) => {
             try {
                 const token = authHeader.split(" ")[1];
                 const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
-                if (decoded.is_admin || (order.user_id && order.user_id.toString() === decoded.id)) {
+                if (decoded.is_admin) {
                     hasAccess = true;
+                } else if (order.user_id) {
+                    if (order.user_id.toString() === decoded.id) {
+                        hasAccess = true;
+                    } else {
+                        const userDoc = await User.findById(decoded.id);
+                        if (userDoc && userDoc.userId === order.user_id) {
+                            hasAccess = true;
+                        }
+                    }
                 }
             } catch (err) {
-                // Ignore JWT error and fallback to guest token
+                // Ignore
             }
         }
 
@@ -114,20 +108,35 @@ app.get("/api/orders/:id", async (req, res) => {
             return res.status(403).json({ error: "Akses Ditolak", expired: order.isGuest });
         }
 
-        // Enrich items with product & stock details
-        const enrichedItems = await Promise.all(transactions.map(async item => {
+        // Enrich items
+        const allStocks = await ProductStock.find({ orderId: req.params.id }).lean();
+        console.log(`[DEBUG] Found ${allStocks.length} stocks for order ${req.params.id}`);
+        console.log(`[DEBUG] Stocks:`, allStocks.map(s => ({ id: s._id, product: s.productId, orderId: s.orderId })));
+
+        const enrichedItems = await Promise.all(orderDoc.items.map(async item => {
             const product = await Product.findOne({ productId: item.productId }) || await Product.findById(item.productId).catch(() => null);
             let stockContent = null;
-            if (item.stockIds && item.stockIds.length > 0) {
+            let stockId = null;
+
+            const itemStocks = allStocks.filter(s => s.productId === item.productId);
+            console.log(`[DEBUG] Item ${item.productId} mapped to ${itemStocks.length} stocks`);
+            
+            if (itemStocks.length > 0) {
+                stockContent = itemStocks.map(s => s.accountData).join('\n\n---\n\n');
+                stockId = itemStocks[0]._id;
+            } else if (item.stockIds && item.stockIds.length > 0) {
                 const stock = await ProductStock.findById(item.stockIds[0]);
-                if (stock) stockContent = stock.accountData;
+                if (stock) {
+                    stockContent = stock.accountData;
+                    stockId = stock._id;
+                }
             }
             return {
-                id: item._id,
+                id: item._id, // if any
                 quantity: item.quantity,
                 price: item.price,
                 product_id: item.productId,
-                stock_id: item.stockIds && item.stockIds.length > 0 ? item.stockIds[0] : null,
+                stock_id: stockId,
                 products: product ? { name: product.name, login_instructions: product.loginInstructions || product.desc } : { name: item.productName },
                 product_stocks: stockContent ? { content: stockContent } : null
             };
@@ -144,9 +153,15 @@ app.get("/api/orders/:id", async (req, res) => {
 
 app.post("/api/orders/:id/create-payment", async (req, res) => {
     try {
-        const transactions = await Transaction.find({ orderId: req.params.id });
-        if (!transactions || transactions.length === 0) return res.status(404).json({ error: "Order not found" });
-        const order = mapTransactionsToOrder(transactions);
+        const orderDoc = await Order.findOne({ orderId: req.params.id });
+        if (!orderDoc) return res.status(404).json({ error: "Order not found" });
+        const order = {
+            id: orderDoc.orderId,
+            status: orderDoc.status,
+            totalPrice: orderDoc.totalAmount,
+            paymentUrl: orderDoc.paymentUrl,
+            paymentReference: orderDoc.paymentReference
+        };
         if (order.status !== 'pending') return res.status(400).json({ error: "Order is not pending" });
         if (order.paymentUrl && order.paymentUrl !== "MOCK_QRIS_URL_FOR_NOW") {
             return res.json({ success: true, paymentUrl: order.paymentUrl, paymentReference: order.paymentReference, totalPrice: order.totalPrice });
@@ -211,8 +226,8 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
                 }
             }
         } else if (gateway === 'kitaqris') {
-            const merchantId = setting?.settings?.merchant_id || process.env.KITAQRIS_MERCHANT_ID || "178753767150";
-            const apiKey = setting?.settings?.api_key || process.env.KITAQRIS_API_KEY || "DsuTmOfKxaQ7Uwt5RVar7Y9gJ5iWhPVxvYtQ8ZM0";
+            const merchantId = setting?.settings?.merchant_id || process.env.KITAQRIS_MERCHANT_ID;
+            const apiKey = setting?.settings?.api_key || process.env.KITAQRIS_API_KEY;
             if (merchantId && apiKey) {
                 try {
                     const response = await axios.post(
@@ -246,7 +261,7 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
 
         paymentUrl = paymentUrl || "MOCK_QRIS_URL_FOR_NOW";
         
-        await Transaction.updateMany(
+        await Order.updateOne(
             { orderId: req.params.id },
             { 
                 $set: { 
@@ -266,11 +281,10 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
 
 app.post("/api/orders/:id/check-payment", async (req, res) => {
     try {
-        const transactions = await Transaction.find({ orderId: req.params.id });
-        if (!transactions || transactions.length === 0) return res.status(404).json({ error: "Order not found" });
-        const order = mapTransactionsToOrder(transactions);
+        const orderDoc = await Order.findOne({ orderId: req.params.id });
+        if (!orderDoc) return res.status(404).json({ error: "Order not found" });
 
-        if (order.status === 'completed' || order.status === 'paid') return res.json({ status: order.status });
+        if (orderDoc.status === 'completed' || orderDoc.status === 'paid') return res.json({ status: orderDoc.status });
 
         const setting = await PaymentGatewaySetting.findOne({ is_active: true });
         const gateway = setting ? setting.gateway_name : 'tokopay';
@@ -282,7 +296,7 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
             const mId = setting?.settings?.merchant_id || process.env.TOKOPAY_MERCHANT;
             const sKey = setting?.settings?.secret_key || process.env.TOKOPAY_SECRET;
             if (mId && sKey) {
-                const url = `https://api.tokopay.id/v1/transaction?merchant=${mId}&secret=${sKey}&ref_id=${order.paymentReference || order.id}`;
+                const url = `https://api.tokopay.id/v1/transaction?merchant=${mId}&secret=${sKey}&ref_id=${orderDoc.paymentReference || orderDoc.orderId}`;
                 const { data } = await axios.get(url);
                 if (data.status === 'Success' && data.data) {
                     const st = data.data.status?.toLowerCase();
@@ -295,10 +309,10 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
         } else if (gateway === 'kazepay') {
             const apiId = setting?.settings?.api_id || process.env.KAZEPAY_API_ID;
             const apiKey = setting?.settings?.api_key || process.env.KAZEPAY_API_KEY;
-            if (apiId && apiKey && order.paymentReference) {
+            if (apiId && apiKey && orderDoc.paymentReference) {
                 try {
                     const response = await axios.get('https://kazepay-api.vercel.app/api/deposit', {
-                        params: { ref_id: order.paymentReference },
+                        params: { ref_id: orderDoc.paymentReference },
                         headers: {
                             'x-api-id': apiId,
                             'x-api-key': apiKey,
@@ -312,14 +326,14 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                     console.error('KazePay check-payment error:', apiErr.response?.data || apiErr.message);
                 }
             } else {
-                isPaid = true; // MOCK if no credentials
+                isPaid = true;
             }
         } else if (gateway === 'kitaqris') {
-            const merchantId = setting?.settings?.merchant_id || process.env.KITAQRIS_MERCHANT_ID || "178753767150";
-            const apiKey = setting?.settings?.api_key || process.env.KITAQRIS_API_KEY || "DsuTmOfKxaQ7Uwt5RVar7Y9gJ5iWhPVxvYtQ8ZM0";
-            if (merchantId && apiKey && order.paymentReference) {
+            const merchantId = setting?.settings?.merchant_id || process.env.KITAQRIS_MERCHANT_ID;
+            const apiKey = setting?.settings?.api_key || process.env.KITAQRIS_API_KEY;
+            if (merchantId && apiKey && orderDoc.paymentReference) {
                 try {
-                    const response = await axios.get(`https://klikqris.com/api/qris/status/${order.paymentReference}`, {
+                    const response = await axios.get(`https://klikqris.com/api/qris/status/${orderDoc.paymentReference}`, {
                         headers: {
                             'x-api-key': apiKey,
                             'id_merchant': merchantId
@@ -335,92 +349,93 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                     console.error('KitaQris check-payment error:', apiErr.response?.data || apiErr.message);
                 }
             } else {
-                isPaid = true; // MOCK if no credentials
+                isPaid = true;
             }
         } else {
              isPaid = true; 
         }
 
         if (isExpired) {
-            await Transaction.updateMany({ orderId: req.params.id }, { $set: { status: 'expired' } });
+            await Order.updateOne({ orderId: req.params.id }, { $set: { status: 'expired' } });
             return res.json({ status: 'expired' });
         }
 
         if (isPaid) {
-            // ALLOCATE STOCK SECURELY
-            const botId = parseInt(process.env.DEFAULT_BOT_ID) || 1;
-            
-            for (const item of transactions) {
-                // If this item was not already allocated
-                if (!item.stockIds || item.stockIds.length === 0) {
-                    const result = await takeProductAccount(botId, item.productId, item.quantity, req.params.id);
-                    if (result.success) {
-                        // find the allocated stock ids for this trxRefId to store in Transaction
-                        const allocatedStocks = await ProductStock.find({ trxRefId: req.params.id, productId: item.productId });
-                        const stockIds = allocatedStocks.map(s => s._id);
-                        await Transaction.findByIdAndUpdate(item._id, {
-                            $set: { stockIds: stockIds }
-                        });
-                    }
-                }
-            }
-
-            await Transaction.updateMany({ orderId: req.params.id }, { $set: { status: 'completed' } });
-            
-            // Send Email Notification Idempotently
-            if (!order.emailSent) {
-                let toEmail = order.isGuest ? order.guestEmail : null;
-                let recipientName = "Pelanggan";
-                if (!order.isGuest && order.userId) {
-                    const wUser = await WebUser.findById(order.userId);
-                    if (wUser && wUser.email) {
-                        toEmail = wUser.email;
-                        recipientName = wUser.name;
-                    }
-                }
+            const result = await processOrderPaymentSuccess(req.params.id);
+            if (result.success) {
+                const orderData = result.order;
                 
-                if (toEmail) {
-                    let orderItemsForEmail = [];
-                    for (const item of transactions) {
-                        const prod = await Product.findOne({ productId: item.productId });
-                        const soldStocks = await ProductStock.find({ trxRefId: req.params.id, productId: item.productId });
-                        
-                        let accountData = soldStocks.map(st => st.accountData).filter(Boolean).join('\n\n---\n\n');
-                        
-                        orderItemsForEmail.push({
-                            name: prod ? prod.name : item.productName,
-                            quantity: item.quantity,
-                            price: item.price,
-                            accountData: accountData || null
-                        });
-                        
-                        console.log(`[Order Email Debug] OrderID: ${req.params.id} | Item: ${prod ? prod.name : item.productId} | Account Details Found: ${soldStocks.length} | AccountData Available: ${!!accountData}`);
+                if (!orderData.emailSent) {
+                    let toEmail = orderData.isGuest ? orderData.guestEmail : null;
+                    let recipientName = "Pelanggan";
+                    if (!orderData.isGuest && orderData.userId) {
+                        const wUser = await User.findById(orderData.userId);
+                        if (wUser && wUser.email) {
+                            toEmail = wUser.email;
+                            recipientName = wUser.name;
+                        }
                     }
                     
-                    const orderData = {
-                        orderId: req.params.id,
-                        date: new Date(order.createdAt).toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
-                        totalAmount: order.totalPrice,
-                        items: orderItemsForEmail,
-                        recipientName
-                    };
-                    
-                    console.log(`[Order Email Debug] Sending email to ${toEmail} for OrderID: ${req.params.id} with ${orderItemsForEmail.length} items.`);
-                    
-                    const emailResult = await sendOrderEmail(toEmail, orderData);
-                    if (emailResult && emailResult.success) {
-                        console.log(`[Order Email Debug] Email sent successfully for OrderID: ${req.params.id}`);
-                        await Transaction.updateMany({ orderId: req.params.id }, { $set: { emailSent: true, emailSentAt: new Date() } });
-                    } else {
-                        console.error("Gagal mengirim email notifikasi:", emailResult ? emailResult.error : 'Unknown');
+                    if (toEmail) {
+                        (async () => {
+                            try {
+                                const allAllocatedStocks = await ProductStock.find({ orderId: req.params.id });
+                                const emailItemsMap = {};
+                                for (const item of orderData.items) {
+                                    if (!emailItemsMap[item.productId]) {
+                                        emailItemsMap[item.productId] = {
+                                            productId: item.productId,
+                                            productName: item.productName,
+                                            quantity: 0,
+                                            price: item.price
+                                        };
+                                    }
+                                    emailItemsMap[item.productId].quantity += item.quantity;
+                                }
+                                
+                                let orderItemsForEmail = [];
+                                for (const pId in emailItemsMap) {
+                                    const group = emailItemsMap[pId];
+                                    const prod = await Product.findOne({ productId: pId });
+                                    const name = prod ? prod.name : group.productName;
+                                    
+                                    const productStocks = allAllocatedStocks.filter(st => st.productId === pId);
+                                    const accountData = productStocks.map(st => st.accountData).filter(Boolean).join('\n\n---\n\n');
+                                    
+                                    orderItemsForEmail.push({
+                                        name: name,
+                                        quantity: group.quantity,
+                                        price: group.price,
+                                        accountData: accountData || null
+                                    });
+                                }
+                                
+                                const orderDataForEmail = {
+                                    orderId: req.params.id,
+                                    date: new Date(orderData.createdAt).toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
+                                    totalAmount: orderData.totalAmount,
+                                    items: orderItemsForEmail,
+                                    recipientName
+                                };
+                                console.log("[EMAIL PAYLOAD TEST]", JSON.stringify(orderDataForEmail, null, 2));
+                                
+                                const emailResult = await sendOrderEmail(toEmail, orderDataForEmail);
+                                if (emailResult && emailResult.success) {
+                                    await Order.updateOne({ orderId: req.params.id }, { $set: { emailSent: true, emailSentAt: new Date() } });
+                                }
+                            } catch (err) {
+                                console.error("[Order Email Debug] Background email error:", err.message);
+                            }
+                        })();
                     }
                 }
+                return res.json({ status: 'completed' });
+            } else {
+                return res.json({ status: 'paid_but_stock_failed', error: result.error });
             }
-
-            return res.json({ status: 'completed' });
         }
 
-        res.json({ status: order.status });
+        res.json({ status: orderDoc.status });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -428,7 +443,7 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
 
 app.post("/api/orders/:id/cancel", async (req, res) => {
     try {
-        await Transaction.updateMany({ orderId: req.params.id }, { $set: { status: 'cancelled' } });
+        await Order.updateOne({ orderId: req.params.id }, { $set: { status: 'cancelled' } });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -442,7 +457,7 @@ app.post("/api/auth/login", async (req, res) => {
         const isEmail = identifier.includes('@');
         const query = isEmail ? { email: identifier } : { phone: identifier };
         
-        const user = await WebUser.findOne(query);
+        const user = await User.findOne(query);
         if (!user) return res.status(401).json({ error: "Akun tidak ditemukan" });
 
         const isMatch = await user.comparePassword(password);
@@ -459,13 +474,13 @@ app.post("/api/auth/register", async (req, res) => {
     try {
         const { name, email, phone, password } = req.body;
         
-        const existingPhone = await WebUser.findOne({ phone });
+        const existingPhone = await User.findOne({ phone });
         if (existingPhone) return res.status(400).json({ error: "Nomor HP sudah terdaftar" });
 
-        const existingEmail = await WebUser.findOne({ email });
+        const existingEmail = await User.findOne({ email });
         if (existingEmail && email) return res.status(400).json({ error: "Email sudah terdaftar" });
 
-        const user = await WebUser.create({ name, email, phone, password, is_admin: false });
+        const user = await User.create({ userId: Date.now(), isTelegram: false, name, email, phone, password, is_admin: false });
         const token = jwt.sign({ id: user._id, is_admin: user.is_admin }, process.env.JWT_SECRET || "secret", { expiresIn: "7d" });
         
         res.json({ token, user: { id: user._id, name: user.name, email: user.email, phone: user.phone, is_admin: user.is_admin } });
@@ -497,15 +512,15 @@ app.get("/api/auth/google/callback", async (req, res) => {
 
         const payload = ticket.getPayload();
         
-        let user = await WebUser.findOne({ googleId: payload.sub });
+        let user = await User.findOne({ googleId: payload.sub });
         
         if (!user) {
-            user = await WebUser.findOne({ email: payload.email });
+            user = await User.findOne({ email: payload.email });
             if (user) {
                 user.googleId = payload.sub;
                 await user.save();
             } else {
-                user = await WebUser.create({
+                user = await User.create({ userId: Date.now(), isTelegram: false,
                     name: payload.name,
                     email: payload.email,
                     googleId: payload.sub,
@@ -539,12 +554,12 @@ app.post("/api/auth/merge-guest", async (req, res) => {
         const { userId, guestId, userEmail } = req.body;
         
         if (guestId && userEmail) {
-            await Transaction.updateMany(
+            await Order.updateMany(
                 { isGuest: true, guestId: guestId, guestEmail: userEmail, source: "website" }, 
                 { $set: { userId: userId, isGuest: false } }
             );
         } else if (guestId) {
-            await Transaction.updateMany(
+            await Order.updateMany(
                 { isGuest: true, guestId: guestId, source: "website" }, 
                 { $set: { userId: userId, isGuest: false } }
             );
@@ -559,26 +574,33 @@ app.post("/api/auth/merge-guest", async (req, res) => {
 app.get("/api/products", async (req, res) => {
     try {
         const botId = parseInt(req.query.botId) || parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
-        const result = await getProductList(botId);
-        if (result.success) {
-            // Map to frontend expected format
-            const mapped = result.data.map(p => ({
+        const products = await Product.find({ botId }).sort({ sort_order: 1 }).lean();
+        
+        const categories = await Category.find({ botId }).lean();
+        const stockAgg = await ProductStock.aggregate([
+            { $match: { botId, status: 'available' } },
+            { $group: { _id: "$productId", count: { $sum: 1 } } }
+        ]);
+        const stockMap = {};
+        stockAgg.forEach(s => stockMap[s._id] = s.count);
+
+        const mapped = products.map(p => {
+            const cat = categories.find(c => p.categoryId && c._id.toString() === p.categoryId.toString());
+            return {
                 id: p.productId,
                 name: p.name,
                 description: p.desc,
                 price: p.price,
-                stock: p.stock,
-                category: p.category,
+                stock: stockMap[p.productId] || 0,
+                category: cat ? cat.name : "Uncategorized",
                 image_url: p.image_url,
                 original_price: p.original_price,
                 login_instructions: p.login_instructions,
                 min_order: p.min_order,
                 max_order: p.max_order
-            }));
-            res.json(mapped);
-        } else {
-            res.status(500).json({ error: result.error });
-        }
+            };
+        });
+        res.json(mapped);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -592,16 +614,14 @@ app.get("/api/categories", async (req, res) => {
         // Enrich with product data
         const products = await Product.find({ botId }).sort({ sort_order: 1 }).lean();
         const stockAgg = await ProductStock.aggregate([
-            { $match: { botId, isSold: false } },
+            { $match: { botId, status: 'available' } },
             { $group: { _id: "$productId", count: { $sum: 1 } } }
         ]);
         const stockMap = {};
         stockAgg.forEach(s => stockMap[s._id] = s.count);
         
         const result = categories.map(cat => {
-            // Because products are already sorted by sort_order: 1, 
-            // the filtered list will maintain this order.
-            const catProducts = products.filter(p => cat.products && cat.products.includes(p.productId)).map(p => ({
+            const catProducts = products.filter(p => p.categoryId && p.categoryId.toString() === cat._id.toString()).map(p => ({
                 id: p.productId,
                 name: p.name,
                 description: p.desc,
@@ -640,7 +660,7 @@ app.get("/api/stock/:productId", async (req, res) => {
     try {
         const { productId } = req.params;
         const botId = parseInt(req.query.botId) || parseInt(process.env.DEFAULT_BOT_ID) || 1;
-        const stockCount = await ProductStock.countDocuments({ botId, productId, isSold: false });
+        const stockCount = await ProductStock.countDocuments({ botId, productId, status: 'available' });
         res.json({ stock: stockCount });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -650,8 +670,30 @@ app.get("/api/stock/:productId", async (req, res) => {
 // ======== SETTINGS ROUTES ========
 app.get("/api/settings/payment-gateway", async (req, res) => {
     try {
+        let isAdmin = false;
+        try {
+            const authHeader = req.headers.authorization;
+            if (authHeader) {
+                const token = authHeader.split(" ")[1];
+                const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+                if (decoded && decoded.is_admin) isAdmin = true;
+            }
+        } catch(e) {}
+
         const settings = await PaymentGatewaySetting.find();
-        res.json(settings);
+        if (isAdmin) {
+            res.json(settings);
+        } else {
+            const safeSettings = settings.map(s => {
+                const obj = s.toObject ? s.toObject() : s;
+                return {
+                    _id: obj._id,
+                    gateway_name: obj.gateway_name,
+                    is_active: obj.is_active,
+                };
+            });
+            res.json(safeSettings);
+        }
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -661,42 +703,23 @@ app.get("/api/settings/payment-gateway", async (req, res) => {
 app.post("/api/orders", async (req, res) => {
     try {
         const { userId, isGuest, guestEmail, guestId, items } = req.body;
-        
-        let calculatedTotal = 0;
         const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
         
-        const validatedItems = [];
-        for (const item of items) {
-            const product = await Product.findOne({ botId, productId: item.productId });
-            if (!product) return res.status(400).json({ error: `Produk ${item.productId} tidak ditemukan` });
-            
-            const availableStock = await ProductStock.countDocuments({ botId, productId: item.productId, isSold: false });
-            if (availableStock < item.quantity) {
-                return res.status(400).json({ error: `Stok untuk ${product.name} tidak mencukupi (Sisa: ${availableStock})` });
+        let numericUserId = null;
+        if (!isGuest && userId) {
+            // Check if userId is a 24-char hex string (MongoDB ObjectId)
+            if (typeof userId === 'string' && userId.length === 24) {
+                const userDoc = await User.findById(userId);
+                if (!userDoc) return res.status(400).json({ error: "User tidak ditemukan" });
+                numericUserId = userDoc.userId;
+            } else {
+                numericUserId = Number(userId);
+                if (isNaN(numericUserId)) return res.status(400).json({ error: "userId tidak valid" });
             }
-            
-            const itemTotal = product.price * item.quantity;
-            calculatedTotal += itemTotal;
-            
-            validatedItems.push({
-                productId: item.productId,
-                productName: product.name,
-                quantity: item.quantity,
-                price: product.price,
-                totalAmount: itemTotal
-            });
         }
-        
-        const frontendTotal = req.body.total_price || calculatedTotal;
-        const diff = frontendTotal - calculatedTotal;
-        if (diff > 0 && diff <= 999) {
-            calculatedTotal = frontendTotal; 
-            // adjust totalAmount of the first item to match frontend exact total
-            validatedItems[0].totalAmount += diff;
-        } else if (diff !== 0) {
-            return res.status(400).json({ error: "Terjadi ketidaksesuaian harga dengan database. Silakan muat ulang halaman." });
-        }
-        
+
+        if (!items || items.length === 0) return res.status(400).json({ error: "Keranjang kosong" });
+
         let guestToken = null;
         let guestTokenHash = null;
         let guestTokenExpires = null;
@@ -704,42 +727,57 @@ app.post("/api/orders", async (req, res) => {
         if (isGuest) {
             guestToken = crypto.randomBytes(32).toString("hex");
             guestTokenHash = await bcrypt.hash(guestToken, 10);
-            guestTokenExpires = new Date(Date.now() + 3 * 60 * 60 * 1000); // 3 hours
+            guestTokenExpires = new Date(Date.now() + 3 * 60 * 60 * 1000); 
         }
 
         const newOrderId = `ORD-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
         
-        const transactionsToInsert = [];
-        for (let i = 0; i < validatedItems.length; i++) {
-            const item = validatedItems[i];
-            for (let j = 0; j < item.quantity; j++) {
-                transactionsToInsert.push({
-                    userId: isGuest ? null : userId,
-                    botId,
-                    productId: item.productId,
-                    productName: item.productName,
-                    quantity: 1,
-                    price: item.price,
-                    totalAmount: item.price,
-                    status: 'pending',
-                    reffId: `${newOrderId}-${i}-${j}`,
-                    source: 'website',
-                    orderId: newOrderId,
-                    isGuest,
-                    guestEmail,
-                    guestId,
-                    guestTokenHash,
-                    guestTokenExpires,
-                    paymentMethod: 'qris'
-                });
+        let totalAmount = 0;
+        let orderItems = [];
+
+        // Loop over items and validate prices & reserve stock
+        for (const item of items) {
+            const product = await Product.findOne({ botId, productId: item.productId });
+            if (!product) return res.status(400).json({ error: `Produk tidak ditemukan: ${item.productId}` });
+
+            const subtotal = product.price * item.quantity;
+            totalAmount += subtotal;
+
+            orderItems.push({
+                productId: product.productId,
+                productName: product.name,
+                quantity: item.quantity,
+                price: product.price,
+                subtotal: subtotal
+            });
+
+            const stockRes = await reserveStockAtomic(botId, product.productId, item.quantity, newOrderId);
+            if (!stockRes.success) {
+                // If any reservation fails, we should release all previously reserved stocks for this order
+                await ProductStock.updateMany(
+                    { orderId: newOrderId, status: 'reserved' },
+                    { $set: { status: 'available', orderId: null, reservedAt: null } }
+                );
+                return res.status(400).json({ error: `Stok tidak mencukupi untuk ${product.name}` });
             }
         }
-        // Apply frontend total diff to the very first item if any
-        if (diff > 0 && diff <= 999 && transactionsToInsert.length > 0) {
-            transactionsToInsert[0].totalAmount += diff;
-        }
 
-        await Transaction.insertMany(transactionsToInsert);
+        // Create the actual order
+        await Order.create({
+            orderId: newOrderId,
+            botId,
+            userId: isGuest ? null : numericUserId,
+            source: 'web',
+            isGuest,
+            guestEmail,
+            guestId,
+            guestTokenHash,
+            guestTokenExpires,
+            items: orderItems,
+            totalAmount,
+            status: 'pending',
+            paymentMethod: 'qris'
+        });
 
         res.json({ success: true, orderId: newOrderId, guestToken });
     } catch (err) {
@@ -752,29 +790,53 @@ app.post("/api/orders", async (req, res) => {
 app.get('/api/orders', async (req, res) => {
     try {
         const { userId, isGuest, guestId } = req.query;
-        let query = { source: 'website' };
+        let query = { source: 'web' };
         
-        // Prevent fetching ALL orders unconditionally
         if (userId && userId !== 'undefined') {
-            query.userId = userId;
+            if (typeof userId === 'string' && userId.length === 24) {
+                const userDoc = await User.findById(userId);
+                query.userId = userDoc ? userDoc.userId : -1;
+            } else {
+                query.userId = Number(userId);
+            }
         } else if (isGuest === 'true' && guestId) {
             query.guestId = guestId;
         } else {
-            // Require some user identifier to fetch user orders
             return res.json([]);
         }
         
-        // Find distinct orders
-        const transactions = await Transaction.find(query).sort({ createdAt: -1 }).limit(100);
+        const orders = await Order.find(query).sort({ createdAt: -1 }).limit(100);
         
-        // Group by orderId
-        const orderMap = {};
-        for (const t of transactions) {
-            if (!orderMap[t.orderId]) orderMap[t.orderId] = [];
-            orderMap[t.orderId].push(t);
-        }
+        const mapped = orders.map(orderDoc => ({
+            _id: orderDoc.orderId,
+            id: orderDoc.orderId,
+            userId: orderDoc.userId,
+            user_id: orderDoc.userId,
+            guestEmail: orderDoc.guestEmail,
+            guest_email: orderDoc.guestEmail,
+            isGuest: orderDoc.isGuest,
+            totalPrice: orderDoc.totalAmount,
+            total_price: orderDoc.totalAmount,
+            paymentUrl: orderDoc.paymentUrl,
+            payment_url: orderDoc.paymentUrl,
+            paymentReference: orderDoc.paymentReference,
+            payment_reference: orderDoc.paymentReference,
+            createdAt: orderDoc.createdAt,
+            created_at: orderDoc.createdAt,
+            status: orderDoc.status,
+            guestTokenHash: orderDoc.guestTokenHash,
+            guestTokenExpires: orderDoc.guestTokenExpires,
+            emailSent: orderDoc.emailSent,
+            items: orderDoc.items.map(t => ({
+                id: t._id,
+                productId: t.productId,
+                quantity: t.quantity,
+                priceAtTime: t.price,
+                stockId: t.stockIds && t.stockIds.length > 0 ? t.stockIds[0] : null,
+                products: { name: t.productName }
+            }))
+        }));
         
-        const mapped = Object.values(orderMap).map(grouped => mapTransactionsToOrder(grouped)).filter(Boolean);
         // Sort by created_at desc
         mapped.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
         
@@ -921,16 +983,14 @@ app.get('/api/admin/transactions', async (req, res) => {
         
         if (search) {
             query.$or = [
-                { reffId: { $regex: search, $options: 'i' } },
                 { orderId: { $regex: search, $options: 'i' } },
-                { productName: { $regex: search, $options: 'i' } }
+                { 'items.productName': { $regex: search, $options: 'i' } }
             ];
         }
 
         const skip = (page - 1) * limit;
 
-        // Optimasi: Gunakan limit + 1 trick untuk menghindari countDocuments() yang berat
-        const transactions = await Transaction.find(query)
+        const transactions = await Order.find(query)
             .sort({ createdAt: -1 })
             .skip(skip)
             .limit(limit + 1)
@@ -938,11 +998,27 @@ app.get('/api/admin/transactions', async (req, res) => {
 
         const hasNextPage = transactions.length > limit;
         if (hasNextPage) {
-            transactions.pop(); // Hapus item ekstra
+            transactions.pop();
         }
 
+        // Map back to the expected shape (array of transactions vs array of orders)
+        // If frontend expects flat transactions, we flatten it, but for V2, frontend might just accept orders.
+        // Let's return the orders. Wait, the frontend might be expecting flat transactions.
+        // Assuming frontend handles 'transactions' as orders if they contain orderId, totalAmount, etc.
+        const mappedData = transactions.map(order => {
+             // to maintain compatibility, return order-like objects
+             return {
+                 ...order,
+                 _id: order.orderId, // map _id to orderId for compatibility
+                 reffId: order.orderId,
+                 productName: order.items.map(i => i.productName).join(', '),
+                 quantity: order.items.reduce((s, i) => s + i.quantity, 0),
+                 price: order.totalAmount
+             };
+        });
+
         res.json({
-            data: transactions,
+            data: mappedData,
             pagination: {
                 page,
                 limit,
@@ -957,92 +1033,10 @@ app.get('/api/admin/transactions', async (req, res) => {
 
 app.get('/api/admin/stats', async (req, res) => {
     try {
-        const { period, startDate, endDate, heavy } = req.query;
-        
-        const productsCount = await Product.countDocuments();
-
-        if (heavy !== 'true') {
-            return res.json({ products: productsCount });
-        }
-
-        let matchQuery = {};
-        
-        if (startDate && endDate) {
-            matchQuery.createdAt = {
-                $gte: new Date(startDate),
-                $lte: new Date(endDate)
-            };
-        } else if (period) {
-            const now = new Date();
-            let start = new Date();
-            if (period === 'today') {
-                start.setHours(0,0,0,0);
-            } else if (period === '7d') {
-                start.setDate(now.getDate() - 7);
-            } else if (period === '30d') {
-                start.setDate(now.getDate() - 30);
-            } else if (period === 'month') {
-                start.setDate(1);
-                start.setHours(0,0,0,0);
-            }
-            if (period !== 'all') {
-                matchQuery.createdAt = { $gte: start, $lte: now };
-            }
-        }
-
-        const [telegramAgg, websiteAgg] = await Promise.all([
-            Transaction.aggregate([
-                { $match: { ...matchQuery, source: { $ne: 'website' } } },
-                {
-                    $group: {
-                        _id: null,
-                        orders: { $sum: 1 },
-                        pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } },
-                        completed: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, 1, 0] } },
-                        revenue: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, "$totalAmount", 0] } },
-                        items_sold: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, "$quantity", 0] } }
-                    }
-                }
-            ]),
-            
-            Transaction.aggregate([
-                { $match: { ...matchQuery, source: 'website' } },
-                {
-                    $group: {
-                        _id: "$orderId",
-                        status: { $first: "$status" },
-                        totalAmount: { $sum: "$totalAmount" },
-                        quantity: { $sum: "$quantity" }
-                    }
-                },
-                {
-                    $group: {
-                        _id: null,
-                        orders: { $sum: 1 },
-                        pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } },
-                        completed: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, 1, 0] } },
-                        revenue: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, "$totalAmount", 0] } },
-                        items_sold: { $sum: { $cond: [{ $in: ["$status", ["completed", "paid"]] }, "$quantity", 0] } }
-                    }
-                }
-            ])
-        ]);
-
-        const telegram = telegramAgg[0] || { orders: 0, pending: 0, completed: 0, revenue: 0, items_sold: 0 };
-        const website = websiteAgg[0] || { orders: 0, pending: 0, completed: 0, revenue: 0, items_sold: 0 };
-        
-        res.json({
-            products: productsCount,
-            website,
-            telegram,
-            total: {
-                orders: website.orders + telegram.orders,
-                revenue: website.revenue + telegram.revenue,
-                pending: website.pending + telegram.pending,
-                completed: website.completed + telegram.completed,
-                items_sold: website.items_sold + telegram.items_sold
-            }
-        });
+        const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
+        const statsRes = await getAdminStats(botId);
+        if (!statsRes.success) return res.status(500).json({ error: statsRes.error });
+        res.json(statsRes.data);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -1078,6 +1072,7 @@ app.post('/api/admin/categories', async (req, res) => {
 
 app.delete('/api/admin/categories/:id', async (req, res) => {
     try {
+        await Product.updateMany({ categoryId: req.params.id }, { $unset: { categoryId: "" } });
         await Category.findByIdAndDelete(req.params.id);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1093,52 +1088,43 @@ app.put('/api/admin/categories/:id', async (req, res) => {
 app.post('/api/admin/products', async (req, res) => {
     try {
         const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
-        const p = await Product.create({ ...req.body, botId });
-        
+        let categoryId = null;
         if (req.body.category) {
-            await Category.findOneAndUpdate(
-                { botId, name: req.body.category },
-                { $addToSet: { products: p.productId } },
-                { upsert: true }
-            );
+            const cat = await Category.findOne({ botId, name: req.body.category });
+            if (cat) {
+                categoryId = cat._id;
+            } else {
+                const newCat = await Category.create({ botId, name: req.body.category });
+                categoryId = newCat._id;
+            }
         }
-        
+        const p = await Product.create({ ...req.body, botId, categoryId });
         res.json(p);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.put('/api/admin/products/:id', async (req, res) => {
     try {
         const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
-        const oldP = await Product.findById(req.params.id);
-        const p = await Product.findByIdAndUpdate(req.params.id, req.body, { new: true });
-        
-        if (req.body.category && oldP) {
-            // Remove from all categories first
-            await Category.updateMany(
-                { botId },
-                { $pull: { products: oldP.productId } }
-            );
-            // Add to new category
-            await Category.findOneAndUpdate(
-                { botId, name: req.body.category },
-                { $addToSet: { products: p.productId } },
-                { upsert: true }
-            );
+        let categoryId = undefined;
+        if (req.body.category) {
+            const cat = await Category.findOne({ botId, name: req.body.category });
+            if (cat) {
+                categoryId = cat._id;
+            } else {
+                const newCat = await Category.create({ botId, name: req.body.category });
+                categoryId = newCat._id;
+            }
         }
-
+        const updateData = { ...req.body };
+        if (categoryId !== undefined) {
+            updateData.categoryId = categoryId;
+        }
+        const p = await Product.findByIdAndUpdate(req.params.id, updateData, { new: true });
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.delete('/api/admin/products/:id', async (req, res) => {
     try {
-        const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
-        const p = await Product.findById(req.params.id);
-        if (p) {
-            await Category.updateMany(
-                { botId },
-                { $pull: { products: p.productId } }
-            );
-        }
         await Product.findByIdAndDelete(req.params.id);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1147,7 +1133,7 @@ app.delete('/api/admin/products/:id', async (req, res) => {
 app.get('/api/admin/stocks/stats', async (req, res) => {
     try {
         const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
-        const available = await ProductStock.countDocuments({ botId, isSold: false });
+        const available = await ProductStock.countDocuments({ botId, status: 'available' });
         const sold = await ProductStock.countDocuments({ botId, isSold: true });
         res.json({ available, sold });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1164,7 +1150,7 @@ app.get('/api/admin/stocks', async (req, res) => {
 app.post('/api/admin/stocks', async (req, res) => {
     try {
         const { productId, contents } = req.body;
-        const docs = contents.map(c => ({ botId: parseInt(process.env.DEFAULT_BOT_ID)||1, productId, accountData: c, isSold: false }));
+        const docs = contents.map(c => ({ botId: parseInt(process.env.DEFAULT_BOT_ID)||1, productId, accountData: c, status: 'available' }));
         await ProductStock.insertMany(docs);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1184,6 +1170,12 @@ app.put('/api/admin/stocks/mark-sold', async (req, res) => {
 
 app.post('/api/settings/payment-gateway', async (req, res) => {
     try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+        if (!decoded.is_admin) return res.status(403).json({ error: "Forbidden" });
+
         await PaymentGatewaySetting.updateMany({}, { is_active: false });
         await PaymentGatewaySetting.findOneAndUpdate(
             { gateway_name: req.body.gateway_name },
@@ -1192,6 +1184,126 @@ app.post('/api/settings/payment-gateway', async (req, res) => {
         );
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ======== USER DASHBOARD ROUTES ========
+
+const requireUserAuth = async (req, res, next) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith("Bearer ")) {
+            return res.status(401).json({ error: "Unauthorized" });
+        }
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+        
+        const user = await User.findById(decoded.id);
+        if (!user) {
+            return res.status(401).json({ error: "User tidak ditemukan" });
+        }
+        
+        req.user = user;
+        next();
+    } catch (err) {
+        return res.status(401).json({ error: "Sesi telah berakhir atau tidak valid" });
+    }
+};
+
+app.get("/api/user/profile", requireUserAuth, async (req, res) => {
+    try {
+        const { _id, name, email, phone, createdAt, isTelegram, role } = req.user;
+        res.json({
+            id: _id,
+            name,
+            email,
+            phone,
+            createdAt,
+            isTelegram,
+            role
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.patch("/api/user/profile", requireUserAuth, async (req, res) => {
+    try {
+        const { name, email, phone } = req.body;
+        
+        if (!name || name.trim() === "") {
+            return res.status(400).json({ error: "Nama tidak boleh kosong" });
+        }
+
+        // Cek duplikasi email
+        if (email && email.trim() !== "" && email !== req.user.email) {
+            const existingEmail = await User.findOne({ email });
+            if (existingEmail) return res.status(400).json({ error: "Email sudah digunakan oleh akun lain" });
+        }
+
+        // Cek duplikasi phone
+        if (phone && phone.trim() !== "" && phone !== req.user.phone) {
+            const existingPhone = await User.findOne({ phone });
+            if (existingPhone) return res.status(400).json({ error: "Nomor HP sudah digunakan oleh akun lain" });
+        }
+
+        req.user.name = name;
+        if (email !== undefined) req.user.email = email.trim() === "" ? null : email;
+        if (phone !== undefined) req.user.phone = phone.trim() === "" ? null : phone;
+
+        await req.user.save();
+
+        res.json({ success: true, message: "Profil berhasil diperbarui" });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get("/api/user/statistics", requireUserAuth, async (req, res) => {
+    try {
+        const totalPending = await Order.countDocuments({ userId: req.user.userId, status: 'pending' });
+        
+        res.json({
+            totalTransactions: req.user.stats.totalTransactions,
+            totalSpent: req.user.stats.totalSpent,
+            totalItems: req.user.stats.totalItems,
+            totalPending
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get("/api/user/orders", requireUserAuth, async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const skip = (page - 1) * limit;
+        const status = req.query.status;
+
+        const query = { userId: req.user.userId };
+        if (status && status !== 'semua') {
+            query.status = status;
+        }
+
+        const total = await Order.countDocuments(query);
+        const orders = await Order.find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .lean();
+
+        res.json({
+            data: orders,
+            pagination: {
+                total,
+                page,
+                limit,
+                totalPages: Math.ceil(total / limit)
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.get('/api/settings/theme', (req, res) => res.json({}));

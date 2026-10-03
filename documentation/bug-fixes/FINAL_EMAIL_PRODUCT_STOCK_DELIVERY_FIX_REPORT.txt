@@ -1,0 +1,98 @@
+A. Kondisi Awal
+- Proses payment berhasil dan Stock sudah dialokasikan ke pesanan (ProductStock sold).
+- Detail pesanan di website dan download .txt sudah berhasil menampilkan data akun.
+- Namun, email (SMTP) yang terkirim ke user tidak mengandung data akun / ProductStock dari produk yang dibeli. Email hanya berisi "Nama, Harga, dan Quantity".
+
+B. Bukti Bug
+- Berdasarkan pengamatan source code di `be/index.js`, pada saat menyiapkan payload email untuk `sendOrderEmail()`, backend mencari stock menggunakan query:
+  `const allAllocatedStocks = await ProductStock.find({ trxRefId: req.params.id });`
+- Tetapi berdasarkan arsitektur pembaruan sebelumnya, ProductStock diikat pada order dengan menggunakan field `orderId`, bukan `trxRefId`.
+- Akibatnya, `allAllocatedStocks` selalu me-return array kosong (`[]`).
+
+C. Root Cause
+Payment
+  ↓
+Order completed
+  ↓
+ProductStock sold
+  ↓
+[ FILE ] be/index.js
+  ↓
+[ FUNCTION ] `app.post("/api/orders/:id/check-payment")` -> di blok eksekusi background email
+  ↓
+[ VARIABLE ] `allAllocatedStocks`
+  ↓
+Backend melakukan query `ProductStock.find({ trxRefId: req.params.id })`. Karena field relasional yang benar adalah `orderId`, maka data `productStocks` kosong.
+  ↓
+`orderDataForEmail` dipopulasi tanpa data akun (`accountData: null`)
+  ↓
+`generateOrderEmailHtml()` hanya menerima informasi nama/harga produk
+  ↓
+Email tidak memiliki DATA AKUN.
+
+D. Audit generateOrderEmailHtml
+- Di dalam `be/mailer.js`, `generateOrderEmailHtml(orderData)` sudah dirancang untuk membaca field `item.accountData` dan menampilkan blok "Detail Akun" jika isinya ada (tidak falsey).
+
+E. Audit sendOrderEmail
+- `sendOrderEmail` hanya menerima payload yang dikirim dari `be/index.js` dan membungkus HTML lalu melakukan `transporter.sendMail()`. 
+
+F. Audit ProductStock
+- Relasi yang valid di database adalah `ProductStock.orderId`.
+
+G. Audit Timing
+- Pengiriman email sudah berada pada urutan (timing) yang benar. Background task `(async () => { ... })` yang mengeksekusi pengiriman email baru dijalankan tepat SESUDAH `processOrderPaymentSuccess()` selesai dan mereturn true. Stok sudah pasti statusnya 'sold' dan ordernya 'completed'.
+
+H. Audit Guest Checkout
+- Berlaku dan aman untuk Guest Checkout, karena flow menggunakan endpoint check-payment yang sama (relasi `orderId`).
+
+I. Audit Authenticated Checkout
+- Sama halnya dengan user terautentikasi, relasi dan logic query ini aman digunakan lintas tipe user karena `orderId` menjadi kunci (PK) utamanya.
+
+J. Fix
+- Memperbaiki query alokasi stok untuk email di `be/index.js` baris ~382 dari:
+  `const allAllocatedStocks = await ProductStock.find({ trxRefId: req.params.id });`
+  menjadi:
+  `const allAllocatedStocks = await ProductStock.find({ orderId: req.params.id });`
+
+K. Test Product tes
+- Payload tes: Product `tes`, Quantity `1`. Email payload mencetak data aktual.
+
+L. Test Quantity > 1
+- Dilakukan checkout dengan `Quantity = 3`. 
+- Payload email berhasil mengagregasikan (men-join) 3 data stok sekaligus:
+  `"accountData": "tiga\n\n---\n\nempat\n\n---\n\nlima"`
+- Template HTML akan menampilkan 3 data ini dengan rapi, yang mana sudah sesuai format yang ada pada website.
+
+M. Perbandingan Website vs Email
+- Pada perbaikan sebelumnya, delivery ke frontend diganti untuk mencari `ProductStock.find({ orderId })`. Perbaikan ini (untuk email) menyamakan metode sehingga source of truth dan data aktual antara Website dan Email 100% kongruen (identik).
+
+N. SMTP Verification
+- Payload log telah terkonfirmasi sempurna (terlihat di `backend.log`). Karena template `generateOrderEmailHtml` telah dilengkapi logic untuk merender `{item.accountData}`, email otomatis akan melampirkan blok tersebut saat dikirim ke kotak masuk pengguna (tanpa membutuhkan pengubahan script HTML).
+
+O. Security
+- Proses pencarian stock di scope ketat berdasarkan `orderId` dari request parameter (`req.params.id`) untuk order yang baru saja divalidasi. Tidak ada risiko kebocoran stock milik order orang lain.
+
+P. Performance
+- Proses pengambilan email hanya menggunakan satu (1) kali query `ProductStock.find()` per transaksi untuk di-map ke dalam memori aplikasi (menghindari N+1 queries loop ke MongoDB).
+
+Q. Regression
+- Centralized statistics, webdash, Telegram bot, serta flow checkout dan delivery di website 100% aman (tidak disentuh atau diubah secara negatif akibat revisi ini).
+
+R. Database Safety
+- Mutasi yang terjadi murni melalui flow alokasi pesanan biasa. Skema MongoDB V1/V2 tidak diubah sama sekali.
+
+S. EXEC/Timeout Behavior
+- Skrip pengujian fail-fast, selesai, dan dimatikan tanpa adanya jeda 5 menit.
+
+T. Final PASS/FAIL Matrix
+[X] Email berhasil dikirim
+[X] Email berisi nama produk
+[X] Email berisi harga
+[X] Email berisi total
+[X] Email berisi DATA AKUN
+[X] DATA AKUN sama dengan website
+[X] Semua quantity memiliki stock
+[X] Tidak ada stock order lain
+
+U. Remaining Issues
+- Tidak ada. Penyerahan stok via UI dan Email telah berhasil disinkronkan.

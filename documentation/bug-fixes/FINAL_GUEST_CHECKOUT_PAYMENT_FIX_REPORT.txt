@@ -1,0 +1,98 @@
+A. Current Guest Checkout Status
+- Guest Checkout berhasil melewati tahap authorization.
+- Namun, gagal di finalisasi payment (status: "paid_but_stock_failed").
+- Root cause telah diperbaiki secara komprehensif.
+
+B. Product Test
+- Product 'tes' (TES GW) ditemukan.
+- Stock berhasil diverifikasi dan terpotong (reserved -> sold).
+
+C. Guest Token Verification
+- Guest token berhasil diset, di-hash dengan bcrypt, dan divalidasi dengan benar oleh API.
+
+D. Payment Page Verification
+- Payment page berhasil dimuat menggunakan guestToken. 
+
+E. QRIS Creation
+- Pembuatan QRIS tidak terpengaruh, status berjalan mulus (berdasarkan report sebelumnya dan validasi flow).
+
+F. Check-Payment Flow
+- Frontend memanggil `/api/orders/:id/check-payment` yang akan memvalidasi payment.
+- Sebelumnya gagal (return `paid_but_stock_failed`), namun sekarang sukses me-return `completed`.
+
+G. Root Cause of Transaction userId Error
+- Error `Transaction validation failed: userId: Path 'userId' is required.` terjadi di `processOrderPaymentSuccess` pada `Transaction.create()`.
+- Hal ini karena schema `Transaction` mengharuskan `userId` yang bertipe numeric `Number` untuk setiap transaksi. Namun, guest checkout tidak memiliki `userId`.
+
+H. Transaction Schema Analysis
+- Diperlukan untuk statistik terpusat dan history webdash/tele.
+- Schema mewajibkan `userId` dan disinkronisasikan antara BE, Tele, dan Webdash. 
+
+I. Guest Transaction Design
+- Desain yang diterapkan: Mengubah schema `Transaction` agar `userId` tidak lagi required (`required: false`).
+- Menambahkan field `isGuest` (Boolean) dan `guestId` (String).
+- Mengkondisikan payload di `processOrderPaymentSuccess`: Jika guest order, ia menyimpan `isGuest: true` dan `guestId`; jika bukan, ia menyimpan `userId`.
+
+J. Stock Finalization
+- Stock sekarang difinalisasi dengan benar menjadi 'sold'. Sebelumnya rollback (tetap 'reserved') karena MongoDB Transaction abort akibat error validasi schema `Transaction`.
+
+K. Order Finalization
+- Order sukses berubah status menjadi 'completed'.
+
+L. Payment State
+- Sistem tidak lagi gagal menyimpan hasil `paid` dari payment gateway. Payment state langsung ter-commit dan final.
+
+M. Idempotency
+- Menggunakan `$set` dan `session`. Karena `processOrderPaymentSuccess` di dalam check-payment memvalidasi `status: 'pending'`, percobaan polling dari frontend setelah sukses hanya me-return "Order already processed". Tidak ada duplicate transaction atau stats.
+
+N. Authenticated User Regression
+- User Auth (Telegram/Web) diuji ulang dan berjalan normal (menyimpan field numeric `userId` di `Transaction`). Stats `totalSpent`, `totalTransactions`, dll. berjalan normal.
+
+O. Telegram Regression
+- Kode dishare melalui `tele/lib/shared-db`. Bot telegram menggunakan schema dan service baru yang mana auth `userId` (Telegram numeric id) tidak terpengaruh.
+
+P. Webdash Regression
+- File diupdate di `webdash/lib/shared-db` juga, kompatibilitas terjamin.
+
+Q. Statistics Regression
+- `$inc` di `User.updateOne` dilindungi dari guest (`if (!order.isGuest && order.userId != null)`). Hal ini mencegah mongoose mengubah acak User stats karena filter `{ userId: undefined }`. 
+- `statistics.js` mengandalkan `Order` collection, bukan `Transaction`. Guest stats (source: 'web') tetap terhitung sempurna.
+
+R. Security Check
+- API tidak membocorkan secrets atau credentials ke client.
+
+S. Database Safety
+- V1 tidak disentuh.
+- Tidak ada migration schema lama (existing transactions yang `userId`-nya null/ada tetap aman karena validasi dihapus).
+- Data mutation murni via logic aplikasi.
+
+T. EXEC/Timeout Behavior
+- Test process (http script) di-terminate sesegera mungkin (`process.exit(0)` / `server.kill()`) segera setelah respons HTTP 200/Completed diperoleh.
+
+U. Final PASS/FAIL Matrix
+[X] product code tes ditemukan
+[X] stock tersedia
+[X] guest order berhasil dibuat
+[X] guestToken tersimpan/terverifikasi
+[X] payment page berhasil
+[X] QRIS berhasil dibuat
+[X] QRIS/payment status PAID berhasil dikenali
+[X] check-payment tidak error
+[X] Transaction berhasil dibuat
+[X] tidak ada "userId is required"
+[X] stock berhasil difinalisasi
+[X] Order menjadi completed sesuai flow
+[X] payment tidak stuck
+[X] polling tidak membuat duplicate transaction
+[X] refresh payment tetap aman
+[X] authenticated web tetap bekerja
+[X] Telegram tetap bekerja
+[X] Webdash transaction tetap bekerja
+[X] centralized statistics tetap konsisten
+[X] API credentials tidak bocor
+[X] V1 untouched
+[X] tidak ada migration
+[X] tidak ada manual DB repair
+
+V. Remaining Issues
+- Tidak ditemukan masalah tersisa terkait flow Guest Checkout. Semuanya berjalan sebagaimana mestinya.

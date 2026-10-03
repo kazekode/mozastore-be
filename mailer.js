@@ -1,5 +1,5 @@
 import nodemailer from "nodemailer";
-import { SmtpSetting } from "./database.js";
+import { SmtpSetting } from "./lib/shared-db/index.js";
 
 const escapeHtml = (text) => {
     if (!text) return text;

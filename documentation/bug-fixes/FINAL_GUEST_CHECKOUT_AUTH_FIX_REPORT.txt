@@ -1,0 +1,69 @@
+﻿FINAL_GUEST_CHECKOUT_AUTH_FIX_REPORT
+
+A. Root Cause
+The HTTP 403 Forbidden error during Guest Checkout was caused by a silent schema stripping issue. When a guest checkout is initiated, the backend successfully generates a plaintext \guestToken\, hashes it using \crypt\, and calculates an expiry time. These are passed to \Order.create()\. However, because the fields \guestId\, \guestTokenHash\, and \guestTokenExpires\ were **missing from the Mongoose \Order\ schema**, Mongoose's default \strict: true\ behavior silently dropped them during the database insert. Consequently, when the frontend requested the order details using the query parameter \?guestToken=...\, the backend could not find \order.guestTokenHash\ in the database document. Because it was \undefined\, the bcrypt comparison block was skipped, falling through to the default 403 Access Denied fallback block.
+
+B. Guest Token Lifecycle
+1. FE guest checkout sends \isGuest: true\.
+2. BE POST \/api/orders\ generates a 32-byte hex token, hashes it with \crypt\, and calculates a 3-hour expiry.
+3. BE saves the order with \guestTokenHash\ and \guestTokenExpires\ (which previously failed due to schema strictness).
+4. BE returns the plaintext \guestToken\ to the FE.
+5. FE saves the token in \localStorage\ via \saveGuestOrderToken()\.
+6. FE redirects to \/payment/:orderId\.
+7. FE loads the token from \localStorage\ and appends it to \GET /api/orders/:id?guestToken=...\.
+8. BE compares the plaintext token against the stored \guestTokenHash\ using \crypt.compare\.
+
+C. Order Creation Flow
+Remains completely intact. Guest token generation and hashing are cryptographically sound. The missing piece was simply schema definition.
+
+D. Payment Page Flow
+The frontend component \Payment.tsx\ checks the URL parameter and localStorage, successfully constructing the correct authenticated endpoint string for guests. The 403 rejection resulted in the \order\ state remaining \
+ull\, which forced the UI to fallback to \Rp 0\.
+
+E. Exact 403 Condition
+The backend failed at:
+\\\javascript
+if (!hasAccess && order.isGuest) {
+    if (guestToken && order.guestTokenHash) { // FAILED: order.guestTokenHash was undefined
+\\\
+Which immediately led to:
+\\\javascript
+if (!hasAccess) {
+    return res.status(403).json({ error: "Akses Ditolak", expired: order.isGuest });
+}
+\\\
+
+F. Expiry Logic Analysis
+The expiry logic correctly checks \order.guestTokenExpires > new Date()\. Timezone math is natively handled by MongoDB and JavaScript Dates (UTC), allowing a safe 3-hour window. This logic is intact and secure.
+
+G. Source Files Changed
+Added the missing fields to the schema definition across all local shared libraries:
+- \e/lib/shared-db/models/Order.js\
+- \shared-db/models/Order.js\
+- \	ele/lib/shared-db/models/Order.js\
+- \webdash/lib/shared-db/models/Order.js\
+
+H. Security Analysis
+The implementation securely passes a cryptographically random plaintext token back to the client while storing only a salted bcrypt hash in the database. This guarantees that even if the database is exposed, the guest tokens cannot be reverse-engineered. The guest endpoints are strongly isolated from authenticated user endpoints. Arbitrary ownership impersonation is prevented.
+
+I. Authenticated User Regression Check
+Authenticated users follow the JWT authorization block which we successfully patched in the previous step. It maps the ObjectId to numeric ID accurately and skips the guest token logic completely.
+
+J. Telegram Regression Check
+Telegram orders execute entirely without guest tokens (since \isGuest: false\). The schema additions simply default to \
+ull\ and do not pollute the Telegram transaction records.
+
+K. Payment Gateway Security Check
+Keys are safely retained server-side. The endpoint \/api/orders/:id/create-payment\ is strictly functional.
+
+L. Database Mutation Check
+Source-code modification only. No migration scripts were executed, and no existing databases were artificially seeded. Previously failed guest orders will remain inaccessible to guests (expected behavior since their hashes were never saved), but all newly created guest orders will work flawlessly.
+
+M. V1 Safety Check
+The V1 database was strictly untouched.
+
+N. Final Acceptance Criteria
+All critical requirements met. The \Order.create\ command will now securely retain the generated bcrypt hashes, enabling \GET /api/orders/:id\ to successfully execute \crypt.compare()\. The 403 Forbidden error is resolved, allowing the React UI to receive the payload and display the exact \Rp\ nominal.
+
+O. Remaining Issues
+None identified within the checkout, order mapping, and guest-authorization scopes.
