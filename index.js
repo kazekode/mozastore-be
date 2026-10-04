@@ -113,12 +113,8 @@ app.get("/api/orders/:id", async (req, res) => {
         console.log(`[DEBUG] Found ${allStocks.length} stocks for order ${req.params.id}`);
         console.log(`[DEBUG] Stocks:`, allStocks.map(s => ({ id: s._id, product: s.productId, orderId: s.orderId })));
 
-        let orderSnk = null;
         const enrichedItems = await Promise.all(orderDoc.items.map(async item => {
             const product = await Product.findOne({ productId: item.productId }) || await Product.findById(item.productId).catch(() => null);
-            if (product && product.snk) {
-                orderSnk = product.snk;
-            }
             let stockContent = null;
             let stockId = null;
 
@@ -141,14 +137,13 @@ app.get("/api/orders/:id", async (req, res) => {
                 price: item.price,
                 product_id: item.productId,
                 stock_id: stockId,
-                products: product ? { name: product.name, login_instructions: product.loginInstructions || product.desc } : { name: item.productName },
+                products: product ? { name: product.name, snk: product.snk } : { name: item.productName },
                 product_stocks: stockContent ? { content: stockContent } : null
             };
         }));
 
         res.json({ 
             ...order,
-            snk: orderSnk,
             items: enrichedItems 
         });
     } catch (err) {
@@ -400,14 +395,10 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                                 }
                                 
                                 let orderItemsForEmail = [];
-                                let orderSnkForEmail = null;
                                 for (const pId in emailItemsMap) {
                                     const group = emailItemsMap[pId];
                                     const prod = await Product.findOne({ productId: pId });
                                     const name = prod ? prod.name : group.productName;
-                                    if (prod && prod.snk) {
-                                        orderSnkForEmail = prod.snk;
-                                    }
                                     
                                     const productStocks = allAllocatedStocks.filter(st => st.productId === pId);
                                     const accountData = productStocks.map(st => st.accountData).filter(Boolean).join('\n\n---\n\n');
@@ -416,7 +407,8 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                                         name: name,
                                         quantity: group.quantity,
                                         price: group.price,
-                                        accountData: accountData || null
+                                        accountData: accountData || null,
+                                        snk: prod ? prod.snk : null
                                     });
                                 }
                                 
@@ -425,8 +417,7 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                                     date: new Date(orderData.createdAt).toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
                                     totalAmount: orderData.totalAmount,
                                     items: orderItemsForEmail,
-                                    recipientName,
-                                    snk: orderSnkForEmail
+                                    recipientName
                                 };
                                 console.log("[EMAIL PAYLOAD TEST]", JSON.stringify(orderDataForEmail, null, 2));
                                 
@@ -607,7 +598,7 @@ app.get("/api/products", async (req, res) => {
                 category: cat ? cat.name : "Uncategorized",
                 image_url: p.image_url,
                 original_price: p.original_price,
-                login_instructions: p.login_instructions,
+                snk: p.snk,
                 min_order: p.min_order,
                 max_order: p.max_order
             };
@@ -640,7 +631,7 @@ app.get("/api/categories", async (req, res) => {
                 price: p.price,
                 stock: stockMap[p.productId] || 0,
                 original_price: p.original_price,
-                login_instructions: p.login_instructions,
+                snk: p.snk,
                 min_order: p.min_order,
                 max_order: p.max_order,
                 sort_order: p.sort_order || 0
