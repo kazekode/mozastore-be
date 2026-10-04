@@ -114,7 +114,12 @@ app.get("/api/orders/:id", async (req, res) => {
         console.log(`[DEBUG] Stocks:`, allStocks.map(s => ({ id: s._id, product: s.productId, orderId: s.orderId })));
 
         const enrichedItems = await Promise.all(orderDoc.items.map(async item => {
-            const product = await Product.findOne({ productId: item.productId }) || await Product.findById(item.productId).catch(() => null);
+            const product = await Product.findOne({ botId: orderDoc.botId, productId: item.productId }) || await Product.findById(item.productId).catch(() => null);
+            console.log(`[SNK DEBUG] orderId: ${req.params.id}`);
+            console.log(`[SNK DEBUG] item productId: ${item.productId}`);
+            console.log(`[SNK DEBUG] product found: ${!!product}`);
+            console.log(`[SNK DEBUG] product.snk exists: ${!!(product && product.snk)}`);
+
             let stockContent = null;
             let stockId = null;
 
@@ -131,7 +136,7 @@ app.get("/api/orders/:id", async (req, res) => {
                     stockId = stock._id;
                 }
             }
-            return {
+            const itemPayload = {
                 id: item._id, // if any
                 quantity: item.quantity,
                 price: item.price,
@@ -140,6 +145,8 @@ app.get("/api/orders/:id", async (req, res) => {
                 products: product ? { name: product.name, snk: product.snk } : { name: item.productName },
                 product_stocks: stockContent ? { content: stockContent } : null
             };
+            console.log(`[SNK DEBUG] response item.snk exists: ${!!itemPayload.products.snk}`);
+            return itemPayload;
         }));
 
         res.json({ 
@@ -397,18 +404,23 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                                 let orderItemsForEmail = [];
                                 for (const pId in emailItemsMap) {
                                     const group = emailItemsMap[pId];
-                                    const prod = await Product.findOne({ productId: pId });
+                                    const prod = await Product.findOne({ botId: orderData.botId, productId: pId }) || await Product.findById(pId).catch(() => null);
                                     const name = prod ? prod.name : group.productName;
                                     
                                     const productStocks = allAllocatedStocks.filter(st => st.productId === pId);
                                     const accountData = productStocks.map(st => st.accountData).filter(Boolean).join('\n\n---\n\n');
                                     
+                                    const itemSnk = prod ? prod.snk : null;
+                                    console.log(`[SNK EMAIL DEBUG] orderId: ${req.params.id}`);
+                                    console.log(`[SNK EMAIL DEBUG] item productId: ${pId}`);
+                                    console.log(`[SNK EMAIL DEBUG] item snk exists: ${!!itemSnk}`);
+
                                     orderItemsForEmail.push({
                                         name: name,
                                         quantity: group.quantity,
                                         price: group.price,
                                         accountData: accountData || null,
-                                        snk: prod ? prod.snk : null
+                                        snk: itemSnk
                                     });
                                 }
                                 
