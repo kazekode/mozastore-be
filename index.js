@@ -113,8 +113,12 @@ app.get("/api/orders/:id", async (req, res) => {
         console.log(`[DEBUG] Found ${allStocks.length} stocks for order ${req.params.id}`);
         console.log(`[DEBUG] Stocks:`, allStocks.map(s => ({ id: s._id, product: s.productId, orderId: s.orderId })));
 
+        let orderSnk = null;
         const enrichedItems = await Promise.all(orderDoc.items.map(async item => {
             const product = await Product.findOne({ productId: item.productId }) || await Product.findById(item.productId).catch(() => null);
+            if (product && product.snk) {
+                orderSnk = product.snk;
+            }
             let stockContent = null;
             let stockId = null;
 
@@ -144,6 +148,7 @@ app.get("/api/orders/:id", async (req, res) => {
 
         res.json({ 
             ...order,
+            snk: orderSnk,
             items: enrichedItems 
         });
     } catch (err) {
@@ -395,10 +400,14 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                                 }
                                 
                                 let orderItemsForEmail = [];
+                                let orderSnkForEmail = null;
                                 for (const pId in emailItemsMap) {
                                     const group = emailItemsMap[pId];
                                     const prod = await Product.findOne({ productId: pId });
                                     const name = prod ? prod.name : group.productName;
+                                    if (prod && prod.snk) {
+                                        orderSnkForEmail = prod.snk;
+                                    }
                                     
                                     const productStocks = allAllocatedStocks.filter(st => st.productId === pId);
                                     const accountData = productStocks.map(st => st.accountData).filter(Boolean).join('\n\n---\n\n');
@@ -416,7 +425,8 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                                     date: new Date(orderData.createdAt).toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
                                     totalAmount: orderData.totalAmount,
                                     items: orderItemsForEmail,
-                                    recipientName
+                                    recipientName,
+                                    snk: orderSnkForEmail
                                 };
                                 console.log("[EMAIL PAYLOAD TEST]", JSON.stringify(orderDataForEmail, null, 2));
                                 

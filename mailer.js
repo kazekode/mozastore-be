@@ -125,6 +125,20 @@ export const generateOrderEmailHtml = (orderData) => {
                 </table>
               </td>
             </tr>
+            ${orderData.snk ? `
+            <tr>
+              <td style="padding: 0 40px 20px 40px;">
+                <table role="presentation" style="width: 100%; border-collapse: collapse;">
+                  <tr>
+                    <td style="background-color: #fdf8f6; border: 1px solid #fed7aa; padding: 20px; border-radius: 8px;">
+                      <p style="margin: 0 0 10px 0; font-size: 14px; font-weight: 700; color: #ea580c; text-transform: uppercase; letter-spacing: 0.5px;">Syarat dan Ketentuan</p>
+                      <pre style="margin: 0; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 13px; color: #475569; white-space: pre-wrap; word-break: break-word; line-height: 1.6;">${escapeHtml(orderData.snk)}</pre>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            ` : ''}
             <tr>
               <td style="padding: 0 40px 40px 40px;">
                 <table role="presentation" style="width: 100%; border-collapse: collapse;">
