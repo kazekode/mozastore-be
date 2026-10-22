@@ -9,6 +9,7 @@ import bcrypt from "bcryptjs";
 import axios from "axios";
 import { OAuth2Client } from "google-auth-library";
 import crypto from "crypto";
+import multer from "multer";
 
 dotenv.config();
 
@@ -35,6 +36,40 @@ connectDB().then(() => console.log("MongoDB Connected")).catch(console.error);
 // ======== HELPER ========
 const generateQRIS = (qrisString, amount) => {
     return `${qrisString}`; 
+};
+
+// ======== AUTH & UPLOAD HELPERS ========
+const adminAuth = (req, res, next) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith("Bearer ")) {
+            return res.status(401).json({ error: "Unauthorized: Token tidak disediakan" });
+        }
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+        if (!decoded || !decoded.is_admin) {
+            return res.status(403).json({ error: "Forbidden: Akses ditolak, khusus admin" });
+        }
+        req.user = decoded;
+        next();
+    } catch (err) {
+        return res.status(401).json({ error: "Unauthorized: Token tidak valid atau sesi berakhir" });
+    }
+};
+
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
+});
+
+const getVerifiedImageExt = (buffer) => {
+    if (!buffer || buffer.length < 12) return null;
+    if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return 'jpg';
+    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) return 'png';
+    if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x38) return 'gif';
+    if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+        buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) return 'webp';
+    return null;
 };
 
 
@@ -644,6 +679,7 @@ app.get("/api/categories", async (req, res) => {
                 stock: stockMap[p.productId] || 0,
                 original_price: p.original_price,
                 snk: p.snk,
+                image_url: p.image_url || null,
                 min_order: p.min_order,
                 max_order: p.max_order,
                 sort_order: p.sort_order || 0
@@ -1046,7 +1082,7 @@ app.get('/api/admin/transactions', async (req, res) => {
     }
 });
 
-app.get('/api/admin/stats', async (req, res) => {
+app.get('/api/admin/stats', adminAuth, async (req, res) => {
     try {
         const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
         const statsRes = await getAdminStats(botId);
@@ -1057,7 +1093,104 @@ app.get('/api/admin/stats', async (req, res) => {
     }
 });
 
-app.post('/api/admin/categories/reorder', async (req, res) => {
+// ======== ADMIN IMAGE UPLOAD (PROXY KE CPANEL) ========
+app.post('/api/admin/upload', adminAuth, (req, res, next) => {
+    upload.single('file')(req, res, (err) => {
+        if (err instanceof multer.MulterError) {
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(400).json({ error: "Ukuran file terlalu besar (maksimal 5MB)" });
+            }
+            return res.status(400).json({ error: `Upload error: ${err.message}` });
+        } else if (err) {
+            return res.status(400).json({ error: err.message });
+        }
+        next();
+    });
+}, async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: "File gambar tidak ditemukan dalam request" });
+        }
+
+        // Validasi format file via magic bytes
+        const detectedExt = getVerifiedImageExt(req.file.buffer);
+        if (!detectedExt) {
+            return res.status(400).json({ error: "Format file tidak valid. Hanya JPG, PNG, WEBP, dan GIF yang diizinkan." });
+        }
+
+        const cpanelUploadUrl = process.env.CPANEL_UPLOAD_URL;
+        const cpanelUploadToken = process.env.CPANEL_UPLOAD_TOKEN;
+
+        if (!cpanelUploadUrl || !cpanelUploadToken) {
+            return res.status(500).json({ 
+                error: "Konfigurasi cPanel belum diatur di Koyeb backend (CPANEL_UPLOAD_URL atau CPANEL_UPLOAD_TOKEN belum diset)" 
+            });
+        }
+
+        const folder = (req.body.folder || 'categories').replace(/[^a-zA-Z0-9_-]/g, '');
+
+        // Buat FormData untuk dikirim via HTTPS ke cPanel endpoint
+        const fd = new FormData();
+        fd.append('file', new Blob([req.file.buffer], { type: req.file.mimetype }), req.file.originalname || `image.${detectedExt}`);
+        fd.append('folder', folder);
+        fd.append('token', cpanelUploadToken);
+
+        const response = await axios.post(cpanelUploadUrl, fd, {
+            headers: {
+                'Authorization': `Bearer ${cpanelUploadToken}`
+            },
+            timeout: 30000
+        });
+
+        if (!response.data || !response.data.success || !response.data.url) {
+            return res.status(502).json({ 
+                error: response.data?.error || "Gagal mengunggah gambar ke cPanel hosting" 
+            });
+        }
+
+        res.json({
+            success: true,
+            url: response.data.url,
+            filename: response.data.filename,
+            folder: response.data.folder || folder
+        });
+    } catch (err) {
+        console.error("[Upload Error]", err.response?.data || err.message);
+        const errMsg = err.response?.data?.error || err.message || "Gagal menghubungi endpoint upload cPanel";
+        res.status(502).json({ error: `Upload cPanel gagal: ${errMsg}` });
+    }
+});
+
+app.delete('/api/admin/upload', adminAuth, async (req, res) => {
+    try {
+        const { filename, folder } = req.body;
+        if (!filename) return res.status(400).json({ error: "Parameter filename wajib diisi" });
+
+        const cpanelUploadUrl = process.env.CPANEL_UPLOAD_URL;
+        const cpanelUploadToken = process.env.CPANEL_UPLOAD_TOKEN;
+
+        if (!cpanelUploadUrl || !cpanelUploadToken) {
+            return res.status(500).json({ error: "Konfigurasi cPanel belum diset" });
+        }
+
+        const fd = new FormData();
+        fd.append('action', 'delete');
+        fd.append('filename', filename);
+        if (folder) fd.append('folder', folder);
+        fd.append('token', cpanelUploadToken);
+
+        const response = await axios.post(cpanelUploadUrl, fd, {
+            headers: { 'Authorization': `Bearer ${cpanelUploadToken}` },
+            timeout: 15000
+        });
+
+        res.json(response.data);
+    } catch (err) {
+        res.status(500).json({ error: err.response?.data?.error || err.message });
+    }
+});
+
+app.post('/api/admin/categories/reorder', adminAuth, async (req, res) => {
     try {
         const { order } = req.body; // Array of { id: categoryId, sort_order: index }
         for (const item of order) {
@@ -1067,7 +1200,7 @@ app.post('/api/admin/categories/reorder', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/admin/products/reorder', async (req, res) => {
+app.post('/api/admin/products/reorder', adminAuth, async (req, res) => {
     try {
         const { order } = req.body; // Array of { id: productId, sort_order: index }
         for (const item of order) {
@@ -1077,7 +1210,7 @@ app.post('/api/admin/products/reorder', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/admin/categories', async (req, res) => {
+app.post('/api/admin/categories', adminAuth, async (req, res) => {
     try {
         const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
         const c = await Category.create({ ...req.body, botId });
@@ -1085,7 +1218,7 @@ app.post('/api/admin/categories', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/admin/categories/:id', async (req, res) => {
+app.delete('/api/admin/categories/:id', adminAuth, async (req, res) => {
     try {
         await Product.updateMany({ categoryId: req.params.id }, { $unset: { categoryId: "" } });
         await Category.findByIdAndDelete(req.params.id);
@@ -1093,14 +1226,14 @@ app.delete('/api/admin/categories/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put('/api/admin/categories/:id', async (req, res) => {
+app.put('/api/admin/categories/:id', adminAuth, async (req, res) => {
     try {
         await Category.findByIdAndUpdate(req.params.id, req.body);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/admin/products', async (req, res) => {
+app.post('/api/admin/products', adminAuth, async (req, res) => {
     try {
         const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
         let categoryId = null;
@@ -1117,7 +1250,7 @@ app.post('/api/admin/products', async (req, res) => {
         res.json(p);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.put('/api/admin/products/:id', async (req, res) => {
+app.put('/api/admin/products/:id', adminAuth, async (req, res) => {
     try {
         const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
         let categoryId = undefined;
@@ -1138,7 +1271,7 @@ app.put('/api/admin/products/:id', async (req, res) => {
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.delete('/api/admin/products/:id', async (req, res) => {
+app.delete('/api/admin/products/:id', adminAuth, async (req, res) => {
     try {
         await Product.findByIdAndDelete(req.params.id);
         res.json({ success: true });
