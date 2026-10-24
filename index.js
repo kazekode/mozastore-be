@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { connectDB, Product, Category, User, PaymentGatewaySetting, ProductStock, SmtpSetting, Order, Bot, DailySalesSummary, getAdminStats } from "./lib/shared-db/index.js";
+import { connectDB, Product, Category, User, PaymentGatewaySetting, ProductStock, SmtpSetting, Order, Bot, DailySalesSummary, getAdminStats, Banner } from "./lib/shared-db/index.js";
 import { reserveStockAtomic, processOrderPaymentSuccess } from "./lib/shared-db/services.js";
 import { getTransporter, testSmtpConnection, sendOrderEmail } from "./mailer.js";
 import jwt from "jsonwebtoken";
@@ -1456,6 +1456,82 @@ app.get("/api/user/orders", requireUserAuth, async (req, res) => {
 
 app.get('/api/settings/theme', (req, res) => res.json({}));
 app.post('/api/settings/theme', (req, res) => res.json({ success: true }));
+
+// ======== BANNER ROUTES ========
+
+// Public: hanya banner aktif, diurut sort_order
+app.get('/api/banners', async (req, res) => {
+    try {
+        const banners = await Banner.find({ is_active: true }).sort({ sort_order: 1 }).lean();
+        res.json(banners.map(b => ({
+            id: b._id,
+            image_url: b.image_url,
+            alt: b.alt,
+            sort_order: b.sort_order,
+        })));
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: semua banner
+app.get('/api/admin/banners', adminAuth, async (req, res) => {
+    try {
+        const banners = await Banner.find().sort({ sort_order: 1 }).lean();
+        res.json(banners);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: tambah banner (image_url sudah diupload, simpan metadata saja)
+app.post('/api/admin/banners', adminAuth, async (req, res) => {
+    try {
+        const { image_url, alt, filename, folder } = req.body;
+        if (!image_url) return res.status(400).json({ error: "image_url wajib diisi" });
+        const count = await Banner.countDocuments();
+        const banner = await Banner.create({
+            image_url,
+            alt: alt || "",
+            filename: filename || "",
+            folder: folder || "banners",
+            is_active: true,
+            sort_order: count,
+        });
+        res.json({ success: true, banner });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: update banner (ganti gambar / alt / status)
+app.put('/api/admin/banners/:id', adminAuth, async (req, res) => {
+    try {
+        const allowed = ['image_url', 'alt', 'is_active', 'sort_order', 'filename', 'folder'];
+        const update = {};
+        for (const k of allowed) {
+            if (req.body[k] !== undefined) update[k] = req.body[k];
+        }
+        const banner = await Banner.findByIdAndUpdate(req.params.id, update, { new: true });
+        if (!banner) return res.status(404).json({ error: "Banner tidak ditemukan" });
+        res.json({ success: true, banner });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: reorder (terima array [{ id, sort_order }])
+app.post('/api/admin/banners/reorder', adminAuth, async (req, res) => {
+    try {
+        const { order } = req.body;
+        if (!Array.isArray(order)) return res.status(400).json({ error: "order harus array" });
+        for (const item of order) {
+            await Banner.findByIdAndUpdate(item.id, { sort_order: item.sort_order });
+        }
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin: hapus banner
+app.delete('/api/admin/banners/:id', adminAuth, async (req, res) => {
+    try {
+        const banner = await Banner.findByIdAndDelete(req.params.id);
+        if (!banner) return res.status(404).json({ error: "Banner tidak ditemukan" });
+        res.json({ success: true, filename: banner.filename, folder: banner.folder });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // Default health check endpoint and root route
 app.get('/health', (req, res) => res.json({ status: 'ok', message: 'API is running' }));
