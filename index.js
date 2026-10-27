@@ -34,8 +34,37 @@ const googleClient = new OAuth2Client(
 connectDB().then(() => console.log("MongoDB Connected")).catch(console.error);
 
 // ======== HELPER ========
-const generateQRIS = (qrisString, amount) => {
-    return `${qrisString}`; 
+const generateQRIS = (qris, amount) => {
+    if (!qris) return "";
+    if (!amount) return qris;
+    try {
+        function convertCRC16(str) {
+            let crc = 0xffff;
+            for (let c = 0; c < str.length; c++) {
+                crc ^= str.charCodeAt(c) << 8;
+                for (let i = 0; i < 8; i++) {
+                    crc = crc & 0x8000 ? (crc << 1) ^ 0x1021 : crc << 1;
+                }
+            }
+            crc &= 0xffff;
+            let hex = crc.toString(16).toUpperCase();
+            while (hex.length < 4) hex = "0" + hex;
+            return hex;
+        }
+
+        let q = String(qris).trim();
+        q = q.slice(0, -4);
+        const step1 = q.replace("010211", "010212");
+        const step2 = step1.split("5802ID");
+        if (step2.length < 2) return qris;
+        const nominalStr = String(parseInt(amount, 10));
+        const nominalData = "54" + nominalStr.length.toString().padStart(2, "0") + nominalStr;
+        let hasil = step2[0] + nominalData + "5802ID" + step2[1];
+        hasil += convertCRC16(hasil);
+        return hasil;
+    } catch {
+        return qris;
+    }
 };
 
 // ======== AUTH & UPLOAD HELPERS ========
@@ -267,37 +296,45 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
                     console.error('KazePay create-payment error:', apiErr.response?.data || apiErr.message);
                 }
             }
-        } else if (gateway === 'kitaqris') {
-            const merchantId = setting?.settings?.merchant_id || process.env.KITAQRIS_MERCHANT_ID;
-            const apiKey = setting?.settings?.api_key || process.env.KITAQRIS_API_KEY;
+        } else if (gateway === 'klikqris' || gateway === 'kitaqris') {
+            const merchantId = setting?.settings?.mypg_merchant || setting?.settings?.merchant_id || process.env.KLIKQRIS_MERCHANT_ID || process.env.MYPG_MERCHANT || process.env.KITAQRIS_MERCHANT_ID;
+            const apiKey = setting?.settings?.mypg_api_key || setting?.settings?.api_key || process.env.KLIKQRIS_API_KEY || process.env.MYPG_API_KEY || process.env.KITAQRIS_API_KEY;
+            const qString = setting?.settings?.qris_string || setting?.settings?.mypg_qris || process.env.MYPG_QRIS || "00020101021126610016ID.CO.SHOPEE.WWW01189360091800235569850208235569850303UMI51440014ID.CO.QRIS.WWW0215ID10265761463480303UMI5204581653033605802ID5914SUKA SUKA CELL6006MALANG61056539162070703A0163042E60";
             if (merchantId && apiKey) {
                 try {
                     const response = await axios.post(
-                        'https://klikqris.com/api/qris/create',
+                        'https://klikqris.com/api/qrisv2/create',
                         {
-                            order_id: order.id.toString(),
-                            amount: order.totalPrice,
-                            id_merchant: merchantId
+                            order_id: String(order.id),
+                            amount: parseInt(order.totalPrice, 10),
+                            id_merchant: String(merchantId)
                         },
                         {
                             headers: {
                                 'Content-Type': 'application/json',
                                 'x-api-key': apiKey,
-                                'id_merchant': merchantId
-                            }
+                                'id_merchant': String(merchantId)
+                            },
+                            timeout: 20000
                         }
                     );
-                    const responseData = response.data.data;
-                    if (response.data.status && responseData) {
-                        paymentUrl = responseData.qris_url || responseData.qris_image;
-                        paymentReference = responseData.order_id;
-                        if (responseData.total_amount) {
-                            newTotalPrice = Number(responseData.total_amount);
+                    const orderResponse = response.data;
+                    if (orderResponse && orderResponse.status === true && orderResponse.data) {
+                        paymentUrl = orderResponse.data.qris_url || orderResponse.data.direct_url || orderResponse.data.qris_image;
+                        paymentReference = orderResponse.data.order_id || order.id.toString();
+                        if (orderResponse.data.total_amount) {
+                            newTotalPrice = Number(orderResponse.data.total_amount);
+                        } else if (orderResponse.data.amount) {
+                            newTotalPrice = Number(orderResponse.data.amount);
                         }
                     }
                 } catch (apiErr) {
-                    console.error('KitaQris create-payment error:', apiErr.response?.data || apiErr.message);
+                    console.error('KlikQRIS create-payment error:', apiErr.response?.data || apiErr.message);
                 }
+            }
+            if (!paymentUrl && qString) {
+                paymentUrl = generateQRIS(qString, order.totalPrice);
+                paymentReference = order.id.toString();
             }
         }
 
@@ -370,28 +407,28 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
             } else {
                 isPaid = true;
             }
-        } else if (gateway === 'kitaqris') {
-            const merchantId = setting?.settings?.merchant_id || process.env.KITAQRIS_MERCHANT_ID;
-            const apiKey = setting?.settings?.api_key || process.env.KITAQRIS_API_KEY;
-            if (merchantId && apiKey && orderDoc.paymentReference) {
+        } else if (gateway === 'klikqris' || gateway === 'kitaqris') {
+            const merchantId = setting?.settings?.mypg_merchant || setting?.settings?.merchant_id || process.env.KLIKQRIS_MERCHANT_ID || process.env.MYPG_MERCHANT || process.env.KITAQRIS_MERCHANT_ID;
+            const apiKey = setting?.settings?.mypg_api_key || setting?.settings?.api_key || process.env.KLIKQRIS_API_KEY || process.env.MYPG_API_KEY || process.env.KITAQRIS_API_KEY;
+            const checkRef = orderDoc.paymentReference || orderDoc.orderId;
+            if (merchantId && apiKey && checkRef) {
                 try {
-                    const response = await axios.get(`https://klikqris.com/api/qris/status/${orderDoc.paymentReference}`, {
+                    const response = await axios.get(`https://klikqris.com/api/qrisv2/status/${merchantId}/${checkRef}`, {
                         headers: {
                             'x-api-key': apiKey,
-                            'id_merchant': merchantId
-                        }
+                            'id_merchant': String(merchantId)
+                        },
+                        timeout: 15000
                     });
-                    const responseData = response.data.data;
-                    if (response.data.status && responseData) {
-                        const st = responseData.status?.toLowerCase();
+                    const statusResponse = response.data;
+                    if (statusResponse && statusResponse.status === true && statusResponse.data) {
+                        const st = statusResponse.data.status?.toLowerCase();
                         isPaid = st === 'success' || st === 'paid' || st === 'settlement';
                         isExpired = st === 'expired' || st === 'failed' || st === 'cancel';
                     }
                 } catch (apiErr) {
-                    console.error('KitaQris check-payment error:', apiErr.response?.data || apiErr.message);
+                    console.error('KlikQRIS check-payment error:', apiErr.response?.data || apiErr.message);
                 }
-            } else {
-                isPaid = true;
             }
         } else {
              isPaid = true; 
