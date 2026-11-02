@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { connectDB, Product, Category, User, PaymentGatewaySetting, ProductStock, SmtpSetting, Order, Bot, DailySalesSummary, getAdminStats, Banner } from "./lib/shared-db/index.js";
-import { reserveStockAtomic, processOrderPaymentSuccess } from "./lib/shared-db/services.js";
+import { reserveStockAtomic, processOrderPaymentSuccess, releaseReservedStock } from "./lib/shared-db/services.js";
 import { getTransporter, testSmtpConnection, sendOrderEmail } from "./mailer.js";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
@@ -101,12 +101,65 @@ const getVerifiedImageExt = (buffer) => {
     return null;
 };
 
+const verifyOrderAccess = async (orderDoc, req) => {
+    if (!orderDoc) return { hasAccess: false };
+
+    // 1. Check Admin or Authenticated User JWT
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+        try {
+            const token = authHeader.split(" ")[1];
+            const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+            if (decoded && decoded.is_admin) {
+                return { hasAccess: true, isAdmin: true };
+            }
+            if (orderDoc.userId) {
+                if (orderDoc.userId.toString() === decoded.id) {
+                    return { hasAccess: true, isUser: true };
+                }
+                const userDoc = await User.findById(decoded.id);
+                if (userDoc && userDoc.userId === orderDoc.userId) {
+                    return { hasAccess: true, isUser: true };
+                }
+            }
+        } catch {
+            // Token invalid, continue to guest check
+        }
+    }
+
+    // 2. Check Guest Order Token
+    if (orderDoc.isGuest) {
+        const guestToken = req.headers['x-guest-token'] || req.query.guestToken || req.body?.guestToken;
+        if (guestToken && orderDoc.guestTokenHash) {
+            try {
+                const isMatch = await bcrypt.compare(guestToken, orderDoc.guestTokenHash);
+                if (isMatch) {
+                    if (orderDoc.guestTokenExpires && orderDoc.guestTokenExpires > new Date()) {
+                        return { hasAccess: true, isGuest: true };
+                    } else {
+                        return { hasAccess: false, expired: true, isGuest: true };
+                    }
+                }
+            } catch {
+                // bcrypt compare error
+            }
+        }
+    }
+
+    return { hasAccess: false };
+};
+
 
 // ======== ORDER PROCESS ROUTES ========
 app.get("/api/orders/:id", async (req, res) => {
     try {
         const orderDoc = await Order.findOne({ orderId: req.params.id });
         if (!orderDoc) return res.status(404).json({ error: "Order not found" });
+
+        const access = await verifyOrderAccess(orderDoc, req);
+        if (!access.hasAccess) {
+            return res.status(403).json({ error: access.expired ? "Akses transaksi telah berakhir" : "Akses Ditolak", expired: !!access.expired });
+        }
 
         const order = {
             _id: orderDoc.orderId,
@@ -129,48 +182,6 @@ app.get("/api/orders/:id", async (req, res) => {
             guestTokenExpires: orderDoc.guestTokenExpires,
             emailSent: orderDoc.emailSent
         };
-
-        // Access Control Logic
-        let hasAccess = false;
-        const authHeader = req.headers.authorization;
-        if (authHeader && authHeader.startsWith("Bearer ")) {
-            try {
-                const token = authHeader.split(" ")[1];
-                const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
-                if (decoded.is_admin) {
-                    hasAccess = true;
-                } else if (order.user_id) {
-                    if (order.user_id.toString() === decoded.id) {
-                        hasAccess = true;
-                    } else {
-                        const userDoc = await User.findById(decoded.id);
-                        if (userDoc && userDoc.userId === order.user_id) {
-                            hasAccess = true;
-                        }
-                    }
-                }
-            } catch (err) {
-                // Ignore
-            }
-        }
-
-        if (!hasAccess && order.isGuest) {
-            const { guestToken } = req.query;
-            if (guestToken && order.guestTokenHash) {
-                const isMatch = await bcrypt.compare(guestToken, order.guestTokenHash);
-                if (isMatch) {
-                    if (order.guestTokenExpires && order.guestTokenExpires > new Date()) {
-                        hasAccess = true;
-                    } else {
-                        return res.status(403).json({ error: "Akses transaksi telah berakhir", expired: true });
-                    }
-                }
-            }
-        }
-
-        if (!hasAccess) {
-            return res.status(403).json({ error: "Akses Ditolak", expired: order.isGuest });
-        }
 
         // Enrich items
         const allStocks = await ProductStock.find({ orderId: req.params.id }).lean();
@@ -226,45 +237,57 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
     try {
         const orderDoc = await Order.findOne({ orderId: req.params.id });
         if (!orderDoc) return res.status(404).json({ error: "Order not found" });
-        const order = {
-            id: orderDoc.orderId,
-            status: orderDoc.status,
-            totalPrice: orderDoc.totalAmount,
-            paymentUrl: orderDoc.paymentUrl,
-            paymentReference: orderDoc.paymentReference
-        };
-        if (order.status !== 'pending') return res.status(400).json({ error: "Order is not pending" });
-        if (order.paymentUrl && order.paymentUrl !== "MOCK_QRIS_URL_FOR_NOW") {
-            return res.json({ success: true, paymentUrl: order.paymentUrl, paymentReference: order.paymentReference, totalPrice: order.totalPrice });
+
+        const access = await verifyOrderAccess(orderDoc, req);
+        if (!access.hasAccess) {
+            return res.status(403).json({ error: "Akses Ditolak" });
+        }
+
+        if (orderDoc.status !== 'pending') {
+            return res.status(400).json({ error: `Order is not pending (status: ${orderDoc.status})` });
+        }
+
+        if (orderDoc.paymentUrl && orderDoc.paymentUrl !== "MOCK_QRIS_URL_FOR_NOW") {
+            return res.json({ 
+                success: true, 
+                paymentUrl: orderDoc.paymentUrl, 
+                paymentReference: orderDoc.paymentReference, 
+                totalPrice: orderDoc.totalAmount 
+            });
         }
 
         const setting = await PaymentGatewaySetting.findOne({ is_active: true });
         const gateway = setting ? setting.gateway_name : 'tokopay';
 
         let paymentUrl = null;
-        let paymentReference = order.id.toString();
-        let newTotalPrice = order.totalPrice;
+        let paymentReference = orderDoc.orderId.toString();
+        let newTotalPrice = orderDoc.totalAmount;
 
         if (gateway === 'tokopay') {
             const mId = setting?.settings?.merchant_id || process.env.TOKOPAY_MERCHANT;
             const sKey = setting?.settings?.secret_key || process.env.TOKOPAY_SECRET;
             if (mId && sKey) {
-                const url = `https://api.tokopay.id/v1/order?merchant=${mId}&secret=${sKey}&ref_id=${order.id}&nominal=${order.totalPrice}`;
-                const { data } = await axios.get(url);
-                if (data.status === 'Success' && data.data?.qr_link) {
-                    paymentUrl = data.data.qr_link;
-                    paymentReference = data.data.trx_id;
-                    if (data.data.total_pay) {
-                        newTotalPrice = Number(data.data.total_pay);
-                    } else if (data.data.amount) {
-                        newTotalPrice = Number(data.data.amount);
+                try {
+                    const url = `https://api.tokopay.id/v1/order?merchant=${mId}&secret=${sKey}&ref_id=${orderDoc.orderId}&nominal=${orderDoc.totalAmount}`;
+                    const { data } = await axios.get(url, { timeout: 20000 });
+                    if (data.status === 'Success' && data.data?.qr_link) {
+                        paymentUrl = data.data.qr_link;
+                        paymentReference = data.data.trx_id || orderDoc.orderId.toString();
+                        if (data.data.total_pay) {
+                            newTotalPrice = Number(data.data.total_pay);
+                        } else if (data.data.amount) {
+                            newTotalPrice = Number(data.data.amount);
+                        }
                     }
+                } catch (apiErr) {
+                    console.error('[TokoPay create-payment error]:', apiErr.response?.data || apiErr.message);
                 }
             }
         } else if (gateway === 'orderkuota') {
             const qString = setting?.settings?.qris_string;
             if (qString) {
-                paymentUrl = generateQRIS(qString, order.totalPrice); 
+                paymentUrl = generateQRIS(qString, orderDoc.totalAmount);
+                paymentReference = orderDoc.orderId.toString();
             }
         } else if (gateway === 'kazepay') {
             const apiId = setting?.settings?.api_id || process.env.KAZEPAY_API_ID;
@@ -273,13 +296,14 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
                 try {
                     const response = await axios.post(
                         'https://kazepay-api.vercel.app/api/deposit',
-                        { amount: order.totalPrice },
+                        { amount: orderDoc.totalAmount },
                         {
                             headers: {
                                 'Content-Type': 'application/json',
                                 'x-api-id': apiId,
                                 'x-api-key': apiKey,
                             },
+                            timeout: 20000
                         }
                     );
                     const responseData = response.data.data || response.data;
@@ -293,7 +317,7 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
                         newTotalPrice = Number(responseData.total_pay);
                     }
                 } catch (apiErr) {
-                    console.error('KazePay create-payment error:', apiErr.response?.data || apiErr.message);
+                    console.error('[KazePay create-payment error]:', apiErr.response?.data || apiErr.message);
                 }
             }
         } else if (gateway === 'klikqris' || gateway === 'kitaqris') {
@@ -305,8 +329,8 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
                     const response = await axios.post(
                         'https://klikqris.com/api/qrisv2/create',
                         {
-                            order_id: String(order.id),
-                            amount: parseInt(order.totalPrice, 10),
+                            order_id: String(orderDoc.orderId),
+                            amount: parseInt(orderDoc.totalAmount, 10),
                             id_merchant: String(merchantId)
                         },
                         {
@@ -321,7 +345,7 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
                     const orderResponse = response.data;
                     if (orderResponse && orderResponse.status === true && orderResponse.data) {
                         paymentUrl = orderResponse.data.qris_url || orderResponse.data.direct_url || orderResponse.data.qris_image;
-                        paymentReference = orderResponse.data.order_id || order.id.toString();
+                        paymentReference = orderResponse.data.order_id || orderDoc.orderId.toString();
                         if (orderResponse.data.total_amount) {
                             newTotalPrice = Number(orderResponse.data.total_amount);
                         } else if (orderResponse.data.amount) {
@@ -329,28 +353,30 @@ app.post("/api/orders/:id/create-payment", async (req, res) => {
                         }
                     }
                 } catch (apiErr) {
-                    console.error('KlikQRIS create-payment error:', apiErr.response?.data || apiErr.message);
+                    console.error('[KlikQRIS create-payment error]:', apiErr.response?.data || apiErr.message);
                 }
             }
             if (!paymentUrl && qString) {
-                paymentUrl = generateQRIS(qString, order.totalPrice);
-                paymentReference = order.id.toString();
+                paymentUrl = generateQRIS(qString, orderDoc.totalAmount);
+                paymentReference = orderDoc.orderId.toString();
             }
         }
 
-        paymentUrl = paymentUrl || "MOCK_QRIS_URL_FOR_NOW";
+        if (!paymentUrl) {
+            console.error(`[PAYMENT ERROR] Gagal generate QRIS untuk order ${orderDoc.orderId} via gateway ${gateway}`);
+            return res.status(502).json({ error: "Gagal membuat pembayaran QRIS dari payment gateway. Silakan hubungi admin atau coba lagi." });
+        }
         
         await Order.updateOne(
             { orderId: req.params.id },
             { 
                 $set: { 
                     paymentUrl, 
-                    paymentReference 
+                    paymentReference,
+                    paymentMethod: 'qris'
                 } 
             }
         );
-        // Note: we don't update individual transaction totalAmount if the total gateway amount slightly differs to avoid complexity. 
-        // We just return the newTotalPrice for UI.
 
         res.json({ success: true, paymentUrl, paymentReference, totalPrice: newTotalPrice });
     } catch (err) {
@@ -363,7 +389,20 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
         const orderDoc = await Order.findOne({ orderId: req.params.id });
         if (!orderDoc) return res.status(404).json({ error: "Order not found" });
 
-        if (orderDoc.status === 'completed' || orderDoc.status === 'paid') return res.json({ status: orderDoc.status });
+        const access = await verifyOrderAccess(orderDoc, req);
+        if (!access.hasAccess) {
+            return res.status(403).json({ error: "Akses Ditolak" });
+        }
+
+        // Return immediately if order is already resolved
+        if (orderDoc.status !== 'pending') {
+            return res.json({ status: orderDoc.status });
+        }
+
+        // If paymentReference is missing, cannot check with gateway yet
+        if (!orderDoc.paymentReference) {
+            return res.json({ status: 'pending' });
+        }
 
         const setting = await PaymentGatewaySetting.findOne({ is_active: true });
         const gateway = setting ? setting.gateway_name : 'tokopay';
@@ -374,16 +413,26 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
         if (gateway === 'tokopay') {
             const mId = setting?.settings?.merchant_id || process.env.TOKOPAY_MERCHANT;
             const sKey = setting?.settings?.secret_key || process.env.TOKOPAY_SECRET;
-            if (mId && sKey) {
-                const url = `https://api.tokopay.id/v1/transaction?merchant=${mId}&secret=${sKey}&ref_id=${orderDoc.paymentReference || orderDoc.orderId}`;
-                const { data } = await axios.get(url);
-                if (data.status === 'Success' && data.data) {
-                    const st = data.data.status?.toLowerCase();
-                    isPaid = st === 'success' || st === 'paid';
-                    isExpired = st === 'expired' || st === 'failed';
+            if (mId && sKey && orderDoc.paymentReference) {
+                try {
+                    const url = `https://api.tokopay.id/v1/transaction?merchant=${mId}&secret=${sKey}&ref_id=${orderDoc.paymentReference}`;
+                    const { data } = await axios.get(url, { timeout: 15000 });
+                    if (data.status === 'Success' && data.data) {
+                        const st = data.data.status?.toLowerCase();
+                        if (st === 'success' || st === 'paid') {
+                            const paidAmount = Number(data.data.total_pay || data.data.amount || 0);
+                            if (!paidAmount || paidAmount >= orderDoc.totalAmount) {
+                                isPaid = true;
+                            } else {
+                                console.warn(`[TokoPay] Amount mismatch for ${orderDoc.orderId}: expected >= ${orderDoc.totalAmount}, got ${paidAmount}`);
+                            }
+                        } else if (st === 'expired' || st === 'failed') {
+                            isExpired = true;
+                        }
+                    }
+                } catch (apiErr) {
+                    console.error('[TokoPay check-payment error]:', apiErr.response?.data || apiErr.message);
                 }
-            } else {
-                isPaid = true; 
             }
         } else if (gateway === 'kazepay') {
             const apiId = setting?.settings?.api_id || process.env.KAZEPAY_API_ID;
@@ -396,16 +445,23 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                             'x-api-id': apiId,
                             'x-api-key': apiKey,
                         },
+                        timeout: 15000
                     });
                     const responseData = response.data.data || response.data;
-                    const st = responseData.status?.toLowerCase();
-                    isPaid = st === 'success' || st === 'paid' || st === 'settlement';
-                    isExpired = st === 'expired' || st === 'failed' || st === 'cancel';
+                    const st = responseData?.status?.toLowerCase();
+                    if (st === 'success' || st === 'paid' || st === 'settlement') {
+                        const paidAmount = Number(responseData.amount || responseData.total_amount || responseData.total_pay || 0);
+                        if (!paidAmount || paidAmount >= orderDoc.totalAmount) {
+                            isPaid = true;
+                        } else {
+                            console.warn(`[KazePay] Amount mismatch for ${orderDoc.orderId}: expected >= ${orderDoc.totalAmount}, got ${paidAmount}`);
+                        }
+                    } else if (st === 'expired' || st === 'failed' || st === 'cancel') {
+                        isExpired = true;
+                    }
                 } catch (apiErr) {
-                    console.error('KazePay check-payment error:', apiErr.response?.data || apiErr.message);
+                    console.error('[KazePay check-payment error]:', apiErr.response?.data || apiErr.message);
                 }
-            } else {
-                isPaid = true;
             }
         } else if (gateway === 'klikqris' || gateway === 'kitaqris') {
             const merchantId = setting?.settings?.mypg_merchant || setting?.settings?.merchant_id || process.env.KLIKQRIS_MERCHANT_ID || process.env.MYPG_MERCHANT || process.env.KITAQRIS_MERCHANT_ID;
@@ -423,29 +479,39 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                     const statusResponse = response.data;
                     if (statusResponse && statusResponse.status === true && statusResponse.data) {
                         const st = statusResponse.data.status?.toLowerCase();
-                        isPaid = st === 'success' || st === 'paid' || st === 'settlement';
-                        isExpired = st === 'expired' || st === 'failed' || st === 'cancel';
+                        if (st === 'success' || st === 'paid' || st === 'settlement') {
+                            isPaid = true;
+                        } else if (st === 'expired' || st === 'failed' || st === 'cancel') {
+                            isExpired = true;
+                        }
                     }
                 } catch (apiErr) {
-                    console.error('KlikQRIS check-payment error:', apiErr.response?.data || apiErr.message);
+                    console.error('[KlikQRIS check-payment error]:', apiErr.response?.data || apiErr.message);
                 }
             }
-        } else {
-             isPaid = true; 
         }
 
+        // Strict security: isPaid remains false if not explicitly verified by gateway
+
         if (isExpired) {
-            await Order.updateOne({ orderId: req.params.id }, { $set: { status: 'expired' } });
-            await releaseReservedStock(req.params.id);
+            const updated = await Order.findOneAndUpdate(
+                { orderId: req.params.id, status: 'pending' },
+                { $set: { status: 'expired' } },
+                { new: true }
+            );
+            if (updated) {
+                await releaseReservedStock(req.params.id);
+            }
             return res.json({ status: 'expired' });
         }
 
         if (isPaid) {
-            const result = await processOrderPaymentSuccess(req.params.id);
+            console.log(`[PAYMENT VERIFIED] Order ${req.params.id} confirmed paid via ${gateway}. Processing order completion...`);
+            const result = await processOrderPaymentSuccess(req.params.id, 'qris', orderDoc.paymentReference || req.params.id);
             if (result.success) {
                 const orderData = result.order;
                 
-                if (!orderData.emailSent) {
+                if (orderData && !result.alreadyCompleted && !orderData.emailSent) {
                     let toEmail = orderData.isGuest ? orderData.guestEmail : null;
                     let recipientName = "Pelanggan";
                     if (!orderData.isGuest && orderData.userId) {
@@ -483,9 +549,6 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                                     const accountData = productStocks.map(st => st.accountData).filter(Boolean).join('\n\n---\n\n');
                                     
                                     const itemSnk = prod ? prod.snk : null;
-                                    console.log(`[SNK EMAIL DEBUG] orderId: ${req.params.id}`);
-                                    console.log(`[SNK EMAIL DEBUG] item productId: ${pId}`);
-                                    console.log(`[SNK EMAIL DEBUG] item snk exists: ${!!itemSnk}`);
 
                                     orderItemsForEmail.push({
                                         name: name,
@@ -503,21 +566,21 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
                                     items: orderItemsForEmail,
                                     recipientName
                                 };
-                                console.log("[EMAIL PAYLOAD TEST]", JSON.stringify(orderDataForEmail, null, 2));
                                 
                                 const emailResult = await sendOrderEmail(toEmail, orderDataForEmail);
                                 if (emailResult && emailResult.success) {
                                     await Order.updateOne({ orderId: req.params.id }, { $set: { emailSent: true, emailSentAt: new Date() } });
                                 }
                             } catch (err) {
-                                console.error("[Order Email Debug] Background email error:", err.message);
+                                console.error("[Order Email Error] Background email error:", err.message);
                             }
                         })();
                     }
                 }
                 return res.json({ status: 'completed' });
             } else {
-                return res.json({ status: 'paid_but_stock_failed', error: result.error });
+                console.error(`[PAYMENT ERROR] processOrderPaymentSuccess failed for ${req.params.id}:`, result.error);
+                return res.json({ status: orderDoc.status, error: result.error });
             }
         }
 
@@ -529,9 +592,30 @@ app.post("/api/orders/:id/check-payment", async (req, res) => {
 
 app.post("/api/orders/:id/cancel", async (req, res) => {
     try {
-        await Order.updateOne({ orderId: req.params.id }, { $set: { status: 'cancelled' } });
+        const orderDoc = await Order.findOne({ orderId: req.params.id });
+        if (!orderDoc) return res.status(404).json({ error: "Order not found" });
+
+        const access = await verifyOrderAccess(orderDoc, req);
+        if (!access.hasAccess) {
+            return res.status(403).json({ error: "Akses Ditolak" });
+        }
+
+        if (orderDoc.status !== 'pending') {
+            return res.status(400).json({ error: `Pesanan berstatus '${orderDoc.status}', tidak dapat dibatalkan.` });
+        }
+
+        const updated = await Order.findOneAndUpdate(
+            { orderId: req.params.id, status: 'pending' },
+            { $set: { status: 'cancelled' } },
+            { new: true }
+        );
+
+        if (!updated) {
+            return res.status(400).json({ error: "Pesanan sudah diproses atau tidak berstatus pending." });
+        }
+
         await releaseReservedStock(req.params.id);
-        res.json({ success: true });
+        res.json({ success: true, message: "Pesanan berhasil dibatalkan" });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -789,24 +873,50 @@ app.get("/api/settings/payment-gateway", async (req, res) => {
 
 // ======== ORDER ROUTES ========
 app.post("/api/orders", async (req, res) => {
+    let newOrderId = null;
     try {
         const { userId, isGuest, guestEmail, guestId, items } = req.body;
         const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
-        
-        let numericUserId = null;
-        if (!isGuest && userId) {
-            // Check if userId is a 24-char hex string (MongoDB ObjectId)
-            if (typeof userId === 'string' && userId.length === 24) {
-                const userDoc = await User.findById(userId);
-                if (!userDoc) return res.status(400).json({ error: "User tidak ditemukan" });
-                numericUserId = userDoc.userId;
-            } else {
-                numericUserId = Number(userId);
-                if (isNaN(numericUserId)) return res.status(400).json({ error: "userId tidak valid" });
-            }
+
+        if (!items || !Array.isArray(items) || items.length === 0 || items.length > 50) {
+            return res.status(400).json({ error: "Keranjang kosong atau item melebihi batas (maks 50)" });
         }
 
-        if (!items || items.length === 0) return res.status(400).json({ error: "Keranjang kosong" });
+        // Validate each item structure and quantity
+        for (const item of items) {
+            if (!item.productId || typeof item.productId !== 'string') {
+                return res.status(400).json({ error: "Item productId tidak valid" });
+            }
+            const qty = parseInt(item.quantity, 10);
+            if (isNaN(qty) || qty <= 0 || qty > 1000) {
+                return res.status(400).json({ error: "Jumlah produk harus berupa angka bulat 1 - 1000" });
+            }
+        }
+        
+        let numericUserId = null;
+        if (!isGuest) {
+            // Check if JWT token is present to strictly bind user identity
+            const authHeader = req.headers.authorization;
+            if (authHeader && authHeader.startsWith("Bearer ")) {
+                try {
+                    const token = authHeader.split(" ")[1];
+                    const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+                    const userDoc = await User.findById(decoded.id);
+                    if (userDoc) numericUserId = userDoc.userId;
+                } catch {}
+            }
+            // Fallback to body userId if no valid JWT was verified
+            if (numericUserId === null && userId) {
+                if (typeof userId === 'string' && userId.length === 24) {
+                    const userDoc = await User.findById(userId);
+                    if (!userDoc) return res.status(400).json({ error: "User tidak ditemukan" });
+                    numericUserId = userDoc.userId;
+                } else {
+                    numericUserId = Number(userId);
+                    if (isNaN(numericUserId)) return res.status(400).json({ error: "userId tidak valid" });
+                }
+            }
+        }
 
         let guestToken = null;
         let guestTokenHash = null;
@@ -818,34 +928,34 @@ app.post("/api/orders", async (req, res) => {
             guestTokenExpires = new Date(Date.now() + 3 * 60 * 60 * 1000); 
         }
 
-        const newOrderId = `ORD-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+        newOrderId = `ORD-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
         
         let totalAmount = 0;
         let orderItems = [];
 
         // Loop over items and validate prices & reserve stock
         for (const item of items) {
+            const qty = parseInt(item.quantity, 10);
             const product = await Product.findOne({ botId, productId: item.productId });
-            if (!product) return res.status(400).json({ error: `Produk tidak ditemukan: ${item.productId}` });
+            if (!product) {
+                await releaseReservedStock(newOrderId);
+                return res.status(400).json({ error: `Produk tidak ditemukan: ${item.productId}` });
+            }
 
-            const subtotal = product.price * item.quantity;
+            const subtotal = product.price * qty;
             totalAmount += subtotal;
 
             orderItems.push({
                 productId: product.productId,
                 productName: product.name,
-                quantity: item.quantity,
+                quantity: qty,
                 price: product.price,
                 subtotal: subtotal
             });
 
-            const stockRes = await reserveStockAtomic(botId, product.productId, item.quantity, newOrderId);
+            const stockRes = await reserveStockAtomic(botId, product.productId, qty, newOrderId);
             if (!stockRes.success) {
-                // If any reservation fails, we should release all previously reserved stocks for this order
-                await ProductStock.updateMany(
-                    { orderId: newOrderId, status: 'reserved' },
-                    { $set: { status: 'available', orderId: null, reservedAt: null } }
-                );
+                await releaseReservedStock(newOrderId);
                 return res.status(400).json({ error: `Stok tidak mencukupi untuk ${product.name}` });
             }
         }
@@ -869,6 +979,9 @@ app.post("/api/orders", async (req, res) => {
 
         res.json({ success: true, orderId: newOrderId, guestToken });
     } catch (err) {
+        if (newOrderId) {
+            await releaseReservedStock(newOrderId).catch(() => {});
+        }
         res.status(500).json({ error: err.message });
     }
 });
@@ -881,11 +994,28 @@ app.get('/api/orders', async (req, res) => {
         let query = { source: 'web' };
         
         if (userId && userId !== 'undefined') {
-            if (typeof userId === 'string' && userId.length === 24) {
-                const userDoc = await User.findById(userId);
-                query.userId = userDoc ? userDoc.userId : -1;
+            const authHeader = req.headers.authorization;
+            if (authHeader && authHeader.startsWith("Bearer ")) {
+                try {
+                    const token = authHeader.split(" ")[1];
+                    const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+                    if (!decoded.is_admin) {
+                        const userDoc = await User.findById(decoded.id);
+                        if (!userDoc) return res.status(401).json({ error: "User tidak ditemukan" });
+                        query.userId = userDoc.userId;
+                    } else {
+                        if (typeof userId === 'string' && userId.length === 24) {
+                            const userDoc = await User.findById(userId);
+                            query.userId = userDoc ? userDoc.userId : -1;
+                        } else {
+                            query.userId = Number(userId);
+                        }
+                    }
+                } catch {
+                    return res.status(401).json({ error: "Token tidak valid" });
+                }
             } else {
-                query.userId = Number(userId);
+                return res.status(401).json({ error: "Unauthorized: Silakan login terlebih dahulu" });
             }
         } else if (isGuest === 'true' && guestId) {
             query.guestId = guestId;
@@ -933,14 +1063,8 @@ app.get('/api/orders', async (req, res) => {
 });
 
 // ======== SMTP SETTINGS ========
-app.get('/api/admin/smtp', async (req, res) => {
+app.get('/api/admin/smtp', adminAuth, async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-        const token = authHeader.split(" ")[1];
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
-        if (!decoded.is_admin) return res.status(403).json({ error: "Forbidden" });
-
         const setting = await SmtpSetting.findOne({});
         if (!setting) {
             return res.json({ configured: false });
@@ -956,14 +1080,8 @@ app.get('/api/admin/smtp', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/admin/smtp', async (req, res) => {
+app.post('/api/admin/smtp', adminAuth, async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-        const token = authHeader.split(" ")[1];
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
-        if (!decoded.is_admin) return res.status(403).json({ error: "Forbidden" });
-
         const { email, password, host, port, secure } = req.body;
         let setting = await SmtpSetting.findOne({});
         if (setting) {
@@ -988,14 +1106,8 @@ app.post('/api/admin/smtp', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/admin/smtp/test', async (req, res) => {
+app.post('/api/admin/smtp/test', adminAuth, async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-        const token = authHeader.split(" ")[1];
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
-        if (!decoded.is_admin) return res.status(403).json({ error: "Forbidden" });
-
         const { email, password, host, port, secure } = req.body;
         const configToTest = {
             email, host, port, secure
@@ -1018,14 +1130,8 @@ app.post('/api/admin/smtp/test', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/admin/smtp/send-test', async (req, res) => {
+app.post('/api/admin/smtp/send-test', adminAuth, async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-        const token = authHeader.split(" ")[1];
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
-        if (!decoded.is_admin) return res.status(403).json({ error: "Forbidden" });
-
         const { testEmail } = req.body;
         if (!testEmail) return res.status(400).json({ error: "Email percobaan diperlukan" });
 
@@ -1045,7 +1151,7 @@ app.post('/api/admin/smtp/send-test', async (req, res) => {
 });
 
 // ======== ADMIN ROUTES ========
-app.get('/api/admin/transactions', async (req, res) => {
+app.get('/api/admin/transactions', adminAuth, async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 50;
@@ -1315,16 +1421,16 @@ app.delete('/api/admin/products/:id', adminAuth, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/admin/stocks/stats', async (req, res) => {
+app.get('/api/admin/stocks/stats', adminAuth, async (req, res) => {
     try {
         const botId = parseInt(process.env.DEFAULT_BOT_ID) || 8374872044;
         const available = await ProductStock.countDocuments({ botId, status: 'available' });
-        const sold = await ProductStock.countDocuments({ botId, isSold: true });
+        const sold = await ProductStock.countDocuments({ botId, status: 'sold' });
         res.json({ available, sold });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/admin/stocks', async (req, res) => {
+app.get('/api/admin/stocks', adminAuth, async (req, res) => {
     try {
         const { productId } = req.query;
         const q = productId ? { productId } : {};
@@ -1332,35 +1438,30 @@ app.get('/api/admin/stocks', async (req, res) => {
         res.json(stocks);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.post('/api/admin/stocks', async (req, res) => {
+app.post('/api/admin/stocks', adminAuth, async (req, res) => {
     try {
         const { productId, contents } = req.body;
-        const docs = contents.map(c => ({ botId: parseInt(process.env.DEFAULT_BOT_ID)||1, productId, accountData: c, status: 'available' }));
+        if (!Array.isArray(contents)) return res.status(400).json({ error: "contents harus berupa array" });
+        const docs = contents.map(c => ({ botId: parseInt(process.env.DEFAULT_BOT_ID)||8374872044, productId, accountData: c, status: 'available' }));
         await ProductStock.insertMany(docs);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.delete('/api/admin/stocks', async (req, res) => {
+app.delete('/api/admin/stocks', adminAuth, async (req, res) => {
     try {
         await ProductStock.deleteMany({ _id: { $in: req.body.ids } });
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.put('/api/admin/stocks/mark-sold', async (req, res) => {
+app.put('/api/admin/stocks/mark-sold', adminAuth, async (req, res) => {
     try {
-        await ProductStock.updateMany({ _id: { $in: req.body.ids } }, { $set: { isSold: true } });
+        await ProductStock.updateMany({ _id: { $in: req.body.ids } }, { $set: { status: 'sold', soldAt: new Date() } });
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/settings/payment-gateway', async (req, res) => {
+app.post('/api/settings/payment-gateway', adminAuth, async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-        const token = authHeader.split(" ")[1];
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
-        if (!decoded.is_admin) return res.status(403).json({ error: "Forbidden" });
-
         await PaymentGatewaySetting.updateMany({}, { is_active: false });
         await PaymentGatewaySetting.findOneAndUpdate(
             { gateway_name: req.body.gateway_name },
@@ -1499,7 +1600,7 @@ app.post('/api/settings/theme', (req, res) => res.json({ success: true }));
 // Public: hanya banner aktif, diurut sort_order
 app.get('/api/banners', async (req, res) => {
     try {
-        const banners = await Banner.find({ is_active: true }).sort({ sort_order: 1 }).lean();
+        const banners = await Banner.find({ is_active: true, image_url: { $nin: [null, ""] } }).sort({ sort_order: 1 }).lean();
         res.json(banners.map(b => ({
             id: b._id,
             image_url: b.image_url,
